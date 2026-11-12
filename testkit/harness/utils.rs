@@ -1,0 +1,65 @@
+use std::io::Write;
+use std::process::Stdio;
+use tempfile::NamedTempFile;
+
+/// Check if the current process is running as root (effective UID)
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Get stdio configuration based on DEBUG environment variable
+pub fn get_stdio_config() -> (Stdio, Stdio) {
+    if std::env::var("DEBUG").is_ok() {
+        (Stdio::inherit(), Stdio::inherit())
+    } else {
+        (Stdio::null(), Stdio::null())
+    }
+}
+
+/// Check if DEBUG mode is enabled
+pub fn is_debug_mode() -> bool {
+    std::env::var("DEBUG").is_ok()
+}
+
+/// Create a temporary file with the given content
+pub fn create_temp_file(content: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("Failed to create temp file");
+    file.write_all(content.as_bytes())
+        .expect("Failed to write content to temp file");
+    file.flush().expect("Failed to flush temp file");
+    file
+}
+
+/// Create a temporary config file with appropriate extension (.yaml or .toml)
+/// based on content format detection
+pub fn create_config_file(content: &str) -> NamedTempFile {
+    // Detect config format: YAML starts with "general:" (after trimming), TOML with "[general]"
+    let suffix = if content.trim_start().starts_with("general:") {
+        ".yaml"
+    } else {
+        ".toml"
+    };
+
+    let mut file = tempfile::Builder::new()
+        .suffix(suffix)
+        .tempfile()
+        .expect("Failed to create temp config file");
+    file.write_all(content.as_bytes())
+        .expect("Failed to write content to temp config file");
+    file.flush().expect("Failed to flush temp config file");
+    file
+}
+
+/// Set file permissions (unix only)
+#[cfg(unix)]
+pub fn set_file_permissions(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .expect("Failed to set file permissions");
+}
+
+/// Where the pg_doorman binary lives: $DOORMAN_BIN, else `pg_doorman` from PATH.
+/// (upstream used env!("CARGO_BIN_EXE_pg_doorman"); we run as a standalone crate)
+pub fn doorman_binary() -> String {
+    std::env::var("DOORMAN_BIN").unwrap_or_else(|_| "pg_doorman".to_string())
+}

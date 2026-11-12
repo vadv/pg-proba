@@ -1,0 +1,189 @@
+name: matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['env/**', 'features/**', 'testkit/**', '.github/workflows/matrix.yml']
+
+concurrency:
+  group: matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: pg-proba-test-env
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: compute image tag
+        run: echo "TAG=flake-$(cat env/flake.nix env/flake.lock | shasum -a 256 | cut -c1-16)" >> "$GITHUB_ENV"
+      - name: login ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: check manifest
+        id: exists
+        run: |
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: build and push
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          docker run -d --privileged --name nix-builder -v "$PWD:/src" nixos/nix sleep infinity
+          docker exec nix-builder git config --global --add safe.directory /src
+          docker exec -w /src nix-builder nix --extra-experimental-features "nix-command flakes" build /src/env#dockerImage --out-link /src/env/result
+          TARBALL=/src/env/result/image.tar.gz
+          docker exec nix-builder test -f "$TARBALL" || TARBALL=/src/env/result
+          docker exec nix-builder cat "$TARBALL" | docker load
+          docker tag "${IMAGE_NAME}:latest" "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}"
+          docker push "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}"
+
+  matrix:
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: read
+    name: ${{ matrix.pooler }} / ${{ matrix.shard.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pooler: [odyssey, pgbouncer, pg_doorman]
+        shard:
+          - {name: protocol,        tags: 'msg-parity async pipeline batch protocol-parity named-statement-lru'}
+          - {name: copy-cancel,     tags: 'copy cancel'}
+          - {name: session-state,   tags: 'session-error pscache bufclean coll psne selectin evict dcc pcsp'}
+          - {name: crash,           tags: 'stale fuzz rpipe pipe-disc'}
+          - {name: lang-compiled,   tags: 'lang-go lang-dotnet'}
+          - {name: lang-jvm-script, tags: 'lang-java lang-python lang-nodejs lang-php'}
+    steps:
+      - uses: actions/checkout@v4
+      - name: compute image tag
+        run: echo "TAG=flake-$(cat env/flake.nix env/flake.lock | shasum -a 256 | cut -c1-16)" >> "$GITHUB_ENV"
+      - name: restore cargo cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/caches/cargo-registry
+            ${{ runner.temp }}/caches/cargo-git
+            ${{ runner.temp }}/caches/target
+          # deps зависят только от Cargo.lock; смена харнесса не инвалидирует кеш
+          key: cargo-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-v2-
+      - name: login and pull
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}"
+      - name: compile harness
+        run: |
+          C="${{ runner.temp }}/caches"
+          mkdir -p "$C"/{cargo-registry,cargo-git,target}
+          docker run --rm --init \
+            -v "$PWD:/workspace" -w /workspace \
+            --tmpfs /tmp:exec,mode=1777 \
+            -v "$C/cargo-registry:/root/.cargo/registry" \
+            -v "$C/cargo-git:/root/.cargo/git" \
+            -v "$C/target:/tmp/target" \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}" \
+            cargo test --test bdd --no-run
+      - name: save cargo cache
+        # сразу после компиляции и ДО тестов: cancel/зависание тестов больше не теряет кеш
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/caches/cargo-registry
+            ${{ runner.temp }}/caches/cargo-git
+            ${{ runner.temp }}/caches/target
+          key: cargo-v2-${{ hashFiles('Cargo.lock') }}
+      - name: run shard
+        env:
+          POOLER: ${{ matrix.pooler }}
+        run: |
+          files=""
+          for tag in ${{ matrix.shard.tags }}; do
+            files="$files $(grep -rl --include=steps.feature "^@${tag}\$" features | sort)"
+          done
+          export FEATURES_FILES="$(echo $files)"
+          echo "shard ${{ matrix.shard.name }}: $(echo $FEATURES_FILES | wc -w | tr -d ' ') tests"
+          C="${{ runner.temp }}/caches"
+          mkdir -p "$C"/{cargo-registry,cargo-git,target,gomod,m2,nuget,npm-cache,npm-global} .artifacts/logs
+          docker run --rm --init \
+            -v "$PWD:/workspace" -w /workspace \
+            --tmpfs /tmp:exec,mode=1777 \
+            -v "$C/cargo-registry:/root/.cargo/registry" \
+            -v "$C/cargo-git:/root/.cargo/git" \
+            -v "$C/target:/tmp/target" \
+            -v "$C/gomod:/root/go/pkg/mod" \
+            -v "$C/m2:/root/.m2/repository" \
+            -v "$C/nuget:/root/.nuget/packages" \
+            -v "$C/npm-cache:/root/.npm" \
+            -v "$C/npm-global:/root/.npm-global" \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e POOLER -e FEATURES_FILES \
+            "ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}:${TAG}" \
+            bash -c '
+              cd /workspace
+              fails=0
+              for f in $FEATURES_FILES; do
+                log=".artifacts/logs/$(basename "$(dirname "$f")").log"
+                if FEATURES="$f" cargo test --test bdd >"$log" 2>&1; then
+                  echo "PASS|$POOLER|$f" >> .artifacts/results.txt
+                  echo "PASS $POOLER $f"
+                else
+                  echo "FAIL|$POOLER|$f" >> .artifacts/results.txt
+                  echo "FAIL $POOLER $f"
+                  tail -40 "$log"
+                  cp /tmp/*.log .artifacts/ 2>/dev/null || true
+                  fails=1
+                fi
+              done
+              exit $fails'
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.pooler }}-${{ matrix.shard.name }}
+          path: .artifacts/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  summary:
+    needs: [image, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-logs
+          merge-multiple: true
+      - name: build summary
+        run: |
+          {
+            echo "# Matrix summary"
+            echo
+            echo "| pooler | pass | fail |"
+            echo "|---|---|---|"
+            awk -F'|' '{p[$2]+=($1=="PASS"); f[$2]+=($1=="FAIL")} END {for (k in p) printf "| %s | %d | %d |\n", k, p[k], f[k]}' all-logs/results.txt 2>/dev/null || true
+            echo
+            echo "## Failed tests"
+            echo
+            grep '^FAIL' all-logs/results.txt 2>/dev/null | sort || echo "_none_"
+            echo
+            echo "Логи упавших: артефакты \`logs-<pooler>-<shard>\` (полный cucumber-вывод + /tmp/*.log упавшего теста), забрать:"
+            echo "\`\`\`"
+            echo "gh run download <run-id> -n logs-<pooler>-<shard>"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # ран краснеет только если матрица реально упала — summary всегда зелёный отчёт
+          exit 0

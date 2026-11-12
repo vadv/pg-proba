@@ -1,0 +1,14 @@
+# NOTICE
+
+Этот проект переиспользует материалы:
+
+## ozontech/pg_doorman (MIT)
+
+- Сценарии (`.feature`) корпуса — производные от
+  `https://github.com/ozontech/pg_doorman` → `tests/bdd/features/`.
+- Степ-реализации протокольных шагов, wire-клиент и хелперы запуска пулеров
+  (odyssey/pgbouncer/doorman) — производные от `tests/bdd/*.rs` того же репо.
+
+## yandex/odyssey, pgbouncer/pgbouncer
+
+Используются как тестируемые приложения; их код не включён.

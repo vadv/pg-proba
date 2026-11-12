@@ -1,0 +1,255 @@
+use cucumber::World;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Child;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
+use tempfile::{NamedTempFile, TempDir};
+
+/// Result of a test command execution
+#[derive(Default, Clone)]
+pub struct TestCommandResult {
+    /// Exit code of the command
+    pub exit_code: Option<i32>,
+    /// Standard output
+    pub stdout: String,
+    /// Standard error
+    pub stderr: String,
+    /// Whether the command succeeded (exit code 0)
+    pub success: bool,
+}
+
+/// The World struct holds the state shared across all steps in a scenario.
+#[derive(Default, World)]
+pub struct DoormanWorld {
+    /// Temporary directory for PostgreSQL data
+    pub pg_tmp_dir: Option<TempDir>,
+    /// PostgreSQL port
+    pub pg_port: Option<u16>,
+    /// PostgreSQL database path
+    pub pg_db_path: Option<PathBuf>,
+    /// pg_doorman process handle
+    pub doorman_process: Option<Child>,
+    /// pg_doorman port
+    pub doorman_port: Option<u16>,
+    /// Temporary config file for pg_doorman (kept alive while process runs)
+    pub doorman_config_file: Option<NamedTempFile>,
+    /// Temporary pg_hba file for pg_doorman (kept alive while process runs)
+    pub doorman_hba_file: Option<NamedTempFile>,
+    /// Temporary SSL private key file for pg_doorman
+    pub ssl_key_file: Option<NamedTempFile>,
+    /// Temporary SSL certificate file for pg_doorman
+    pub ssl_cert_file: Option<NamedTempFile>,
+    /// Path to daemon PID file (for cleanup after binary-upgrade)
+    pub doorman_daemon_pid_file: Option<String>,
+    /// Result of the last test command execution
+    pub last_test_result: Option<TestCommandResult>,
+    /// PostgreSQL connection
+    pub pg_conn: Option<crate::pg_connection::PgConnection>,
+    /// pg_doorman connection
+    pub doorman_conn: Option<crate::pg_connection::PgConnection>,
+    /// pgbouncer process handle
+    pub pgbouncer_process: Option<Child>,
+    /// pgbouncer port
+    pub pgbouncer_port: Option<u16>,
+    /// pgbouncer config file
+    pub pgbouncer_config_file: Option<NamedTempFile>,
+    /// pgbouncer userlist file (for authentication)
+    pub pgbouncer_userlist_file: Option<NamedTempFile>,
+    /// odyssey process handle
+    pub odyssey_process: Option<Child>,
+    /// odyssey port
+    pub odyssey_port: Option<u16>,
+    /// odyssey config file
+    pub odyssey_config_file: Option<NamedTempFile>,
+    /// Accumulated messages from PG
+    pub pg_accumulated_messages: Vec<(char, Vec<u8>)>,
+    /// Accumulated messages from Doorman
+    pub doorman_accumulated_messages: Vec<(char, Vec<u8>)>,
+    /// Named sessions (for multi-session tests)
+    pub named_sessions: HashMap<String, crate::pg_connection::PgConnection>,
+    /// Backend PIDs for named sessions
+    pub session_backend_pids: HashMap<String, i32>,
+    /// Secret keys for named sessions (from BackendKeyData, used for cancel requests)
+    pub session_secret_keys: HashMap<String, i32>,
+    /// Named backend PIDs (for storing multiple PIDs per session with custom keys)
+    pub named_backend_pids: HashMap<(String, String), i32>,
+    /// Messages from named sessions (for prepared statements cache tests)
+    pub session_messages: HashMap<String, Vec<(char, Vec<u8>)>>,
+    /// Last used username (for reconnection)
+    pub last_user: Option<String>,
+    /// Last used password (for reconnection)
+    pub last_password: Option<String>,
+    /// Last used database (for reconnection)
+    pub last_database: Option<String>,
+    /// Abort handle for slow scenario warning task (to cancel it when scenario finishes)
+    pub slow_warning_abort: Option<tokio::task::AbortHandle>,
+    /// Dynamic variables for placeholder substitution (e.g., extracted password hashes)
+    pub vars: HashMap<String, String>,
+    /// Extra environment variables to pass to pooler process
+    pub doorman_env: Vec<(String, String)>,
+    /// Soft RLIMIT_NOFILE applied to the pg_doorman child via pre_exec at
+    /// spawn time. None leaves the limit inherited from the test runner.
+    /// Used by `pg_doorman started with NOFILE limit N and config:` to put
+    /// the daemon under a tight fd budget for migration-buffer tests.
+    pub doorman_nofile_limit: Option<u64>,
+    /// Number of extra inheritable pipe fds to open in `pre_exec` before
+    /// `exec`. Used by the polluted-parent scenario to verify that the
+    /// child of a SIGUSR2 upgrade closes inherited fds outside its
+    /// allowlist (see `c891054`). Each unit opens one pipe(2) pair = 2
+    /// fds, and `FD_CLOEXEC` is cleared on both ends so they survive
+    /// `exec`. None means no extra fds are seeded.
+    pub doorman_extra_inheritable_pipes: Option<usize>,
+    pub pg_ssl_ca_cert_file: Option<NamedTempFile>,
+    pub pg_ssl_ca_key_file: Option<NamedTempFile>,
+    pub pg_ssl_cert_file: Option<NamedTempFile>,
+    pub pg_ssl_key_file: Option<NamedTempFile>,
+    pub pg_ssl_client_cert_file: Option<NamedTempFile>,
+    pub pg_ssl_client_key_file: Option<NamedTempFile>,
+    /// CA that did NOT sign the server cert, for negative verification tests.
+    pub pg_ssl_wrong_ca_cert_file: Option<NamedTempFile>,
+    /// Mock Patroni server shutdown signals: host URL -> shutdown flag
+    pub mock_patroni_shutdowns: HashMap<String, Arc<AtomicBool>>,
+    /// Mock Patroni server ports (for tracking active servers)
+    pub mock_patroni_ports: Vec<u16>,
+    /// Mock Patroni server names to ports mapping
+    pub mock_patroni_names: HashMap<String, u16>,
+    /// Mock Patroni server response holders: server name -> shared JSON string
+    pub mock_patroni_responses: HashMap<String, Arc<RwLock<String>>>,
+    /// Acceptor tasks for TCP blackhole listeners started by
+    /// `tests/bdd/blackhole_helper.rs`. Aborted when the world drops.
+    pub blackhole_aborts: crate::blackhole_helper::BlackholeAbortHandles,
+    /// Path to file capturing pg_doorman stderr (set by `pg_doorman log capture enabled`).
+    /// When `Some`, `start_doorman_with_config` redirects the child's stderr there
+    /// so scenarios can assert on log content via `pg_doorman log contains`.
+    pub doorman_log_path: Option<PathBuf>,
+}
+
+impl DoormanWorld {
+    /// Replace all known placeholders in the given text
+    pub fn replace_placeholders(&self, text: &str) -> String {
+        let mut result = text.to_string();
+
+        // Replace port placeholders
+        if let Some(port) = self.doorman_port {
+            result = result.replace("${DOORMAN_PORT}", &port.to_string());
+        }
+        if let Some(port) = self.pg_port {
+            result = result.replace("${PG_PORT}", &port.to_string());
+        }
+        if let Some(port) = self.pgbouncer_port {
+            result = result.replace("${PGBOUNCER_PORT}", &port.to_string());
+        }
+        if let Some(port) = self.odyssey_port {
+            result = result.replace("${ODYSSEY_PORT}", &port.to_string());
+        }
+
+        // Replace temp dir placeholder (for unix_socket_dir)
+        if let Some(ref tmp_dir) = self.pg_tmp_dir {
+            result = result.replace("${PG_TEMP_DIR}", tmp_dir.path().to_str().unwrap());
+        }
+
+        // Replace file path placeholders
+        if let Some(ref hba_file) = self.doorman_hba_file {
+            result = result.replace("${DOORMAN_HBA_FILE}", hba_file.path().to_str().unwrap());
+        }
+        if let Some(ref ssl_key_file) = self.ssl_key_file {
+            result = result.replace("${DOORMAN_SSL_KEY}", ssl_key_file.path().to_str().unwrap());
+        }
+        if let Some(ref ssl_cert_file) = self.ssl_cert_file {
+            result = result.replace(
+                "${DOORMAN_SSL_CERT}",
+                ssl_cert_file.path().to_str().unwrap(),
+            );
+        }
+        if let Some(ref userlist_file) = self.pgbouncer_userlist_file {
+            result = result.replace(
+                "${PGBOUNCER_USERLIST}",
+                userlist_file.path().to_str().unwrap(),
+            );
+        }
+        if let Some(ref config_file) = self.doorman_config_file {
+            result = result.replace(
+                "${DOORMAN_CONFIG_FILE}",
+                config_file.path().to_str().unwrap(),
+            );
+        }
+
+        // pg_doorman binary path (set at compile time by cargo)
+        result = result.replace("${DOORMAN_BINARY}", &crate::utils::doorman_binary());
+
+        // Benchmarking parameters from environment variables
+        let doorman_workers = std::env::var("BENCH_DOORMAN_WORKERS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "12".to_string());
+        result = result.replace("${DOORMAN_WORKERS}", &doorman_workers);
+
+        let odyssey_workers = std::env::var("BENCH_ODYSSEY_WORKERS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "12".to_string());
+        result = result.replace("${ODYSSEY_WORKERS}", &odyssey_workers);
+
+        if let Some(ref f) = self.pg_ssl_ca_cert_file {
+            result = result.replace("${PG_SSL_CA_CERT}", f.path().to_str().unwrap());
+        }
+        if let Some(ref f) = self.pg_ssl_cert_file {
+            result = result.replace("${PG_SSL_CERT}", f.path().to_str().unwrap());
+        }
+        if let Some(ref f) = self.pg_ssl_key_file {
+            result = result.replace("${PG_SSL_KEY}", f.path().to_str().unwrap());
+        }
+        if let Some(ref f) = self.pg_ssl_client_cert_file {
+            result = result.replace("${PG_SSL_CLIENT_CERT}", f.path().to_str().unwrap());
+        }
+        if let Some(ref f) = self.pg_ssl_client_key_file {
+            result = result.replace("${PG_SSL_CLIENT_KEY}", f.path().to_str().unwrap());
+        }
+        if let Some(ref f) = self.pg_ssl_wrong_ca_cert_file {
+            result = result.replace("${PG_SSL_WRONG_CA_CERT}", f.path().to_str().unwrap());
+        }
+
+        // Replace mock Patroni server port placeholders (e.g., ${PATRONI_NODE1_PORT})
+        for (server_name, port) in &self.mock_patroni_names {
+            let placeholder = format!("${{PATRONI_{}_PORT}}", server_name.to_uppercase());
+            result = result.replace(&placeholder, &port.to_string());
+        }
+
+        // Replace dynamic variables from self.vars (e.g., extracted password hashes)
+        for (key, value) in &self.vars {
+            result = result.replace(&format!("${{{}}}", key), value);
+        }
+
+        result
+    }
+}
+
+impl std::fmt::Debug for DoormanWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoormanWorld")
+            .field("pg_tmp_dir", &self.pg_tmp_dir)
+            .field("pg_port", &self.pg_port)
+            .field("pg_db_path", &self.pg_db_path)
+            .field(
+                "doorman_process",
+                &self.doorman_process.as_ref().map(|p| p.id()),
+            )
+            .field("doorman_port", &self.doorman_port)
+            .field(
+                "doorman_config_file",
+                &self.doorman_config_file.as_ref().map(|f| f.path()),
+            )
+            .field(
+                "pgbouncer_process",
+                &self.pgbouncer_process.as_ref().map(|p| p.id()),
+            )
+            .field("pgbouncer_port", &self.pgbouncer_port)
+            .field(
+                "odyssey_process",
+                &self.odyssey_process.as_ref().map(|p| p.id()),
+            )
+            .field("odyssey_port", &self.odyssey_port)
+            .finish()
+    }
+}

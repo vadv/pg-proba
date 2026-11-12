@@ -1,0 +1,952 @@
+use crate::service_helper::stop_process;
+use crate::utils::{
+    create_config_file, create_temp_file, get_stdio_config, is_debug_mode, is_root,
+    set_file_permissions,
+};
+use crate::world::DoormanWorld;
+use cucumber::{gherkin::Step, given, then, when};
+use portpicker::pick_unused_port;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+use tempfile::NamedTempFile;
+use tokio::time::sleep;
+
+/// Generate self-signed SSL certificates for pg_doorman TLS configuration
+#[given("self-signed SSL certificates are generated")]
+pub async fn generate_ssl_certificates(world: &mut DoormanWorld) {
+    let key_file = NamedTempFile::new().expect("Failed to create temp key file");
+    let cert_file = NamedTempFile::new().expect("Failed to create temp cert file");
+
+    let key_path = key_file.path().to_str().unwrap().to_string();
+    let cert_path = cert_file.path().to_str().unwrap().to_string();
+
+    // Generate private key using openssl
+    let key_output = Command::new("openssl")
+        .args(["genrsa", "-out", &key_path, "2048"])
+        .output()
+        .expect("Failed to execute openssl genrsa");
+
+    if !key_output.status.success() {
+        panic!(
+            "Failed to generate SSL private key:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&key_output.stdout),
+            String::from_utf8_lossy(&key_output.stderr)
+        );
+    }
+
+    // Generate self-signed certificate using openssl
+    let cert_output = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-key",
+            &key_path,
+            "-out",
+            &cert_path,
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+        ])
+        .output()
+        .expect("Failed to execute openssl req");
+
+    if !cert_output.status.success() {
+        panic!(
+            "Failed to generate SSL certificate:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&cert_output.stdout),
+            String::from_utf8_lossy(&cert_output.stderr)
+        );
+    }
+
+    world.ssl_key_file = Some(key_file);
+    world.ssl_cert_file = Some(cert_file);
+}
+
+fn run_openssl(args: &[&str]) {
+    let output = Command::new("openssl")
+        .args(args)
+        .output()
+        .expect("Failed to execute openssl");
+    if !output.status.success() {
+        panic!(
+            "openssl {} failed:\nstdout: {}\nstderr: {}",
+            args[0],
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[given("PostgreSQL SSL certificates are generated")]
+pub async fn generate_pg_ssl_certificates(world: &mut DoormanWorld) {
+    // --- CA ---
+    let ca_key_file = NamedTempFile::new().expect("Failed to create temp CA key file");
+    let ca_cert_file = NamedTempFile::new().expect("Failed to create temp CA cert file");
+    let ca_key_path = ca_key_file.path().to_str().unwrap().to_string();
+    let ca_cert_path = ca_cert_file.path().to_str().unwrap().to_string();
+
+    run_openssl(&["genrsa", "-out", &ca_key_path, "2048"]);
+    run_openssl(&[
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        &ca_key_path,
+        "-out",
+        &ca_cert_path,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=TestCA",
+    ]);
+
+    // --- Server cert (with SAN for localhost + 127.0.0.1) ---
+    let server_key_file = NamedTempFile::new().expect("Failed to create temp server key file");
+    let server_cert_file = NamedTempFile::new().expect("Failed to create temp server cert file");
+    let server_csr_file = NamedTempFile::new().expect("Failed to create temp server CSR file");
+    let server_key_path = server_key_file.path().to_str().unwrap().to_string();
+    let server_cert_path = server_cert_file.path().to_str().unwrap().to_string();
+    let server_csr_path = server_csr_file.path().to_str().unwrap().to_string();
+
+    let san_ext_file = tempfile::Builder::new()
+        .suffix(".cnf")
+        .tempfile()
+        .expect("Failed to create SAN extfile");
+    std::fs::write(
+        san_ext_file.path(),
+        "subjectAltName=DNS:localhost,IP:127.0.0.1\n",
+    )
+    .expect("Failed to write SAN extfile");
+    let san_ext_path = san_ext_file.path().to_str().unwrap().to_string();
+
+    run_openssl(&["genrsa", "-out", &server_key_path, "2048"]);
+    run_openssl(&[
+        "req",
+        "-new",
+        "-key",
+        &server_key_path,
+        "-out",
+        &server_csr_path,
+        "-subj",
+        "/CN=localhost",
+    ]);
+    run_openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        &server_csr_path,
+        "-CA",
+        &ca_cert_path,
+        "-CAkey",
+        &ca_key_path,
+        "-CAcreateserial",
+        "-out",
+        &server_cert_path,
+        "-days",
+        "1",
+        "-extfile",
+        &san_ext_path,
+    ]);
+
+    // PostgreSQL requires server key to be mode 0600
+    set_file_permissions(server_key_file.path(), 0o600);
+    // If running as root, PostgreSQL runs as postgres user -- chown the cert files
+    if is_root() {
+        for path in [&server_key_path, &server_cert_path, &ca_cert_path] {
+            Command::new("chown")
+                .arg("postgres:postgres")
+                .arg(path)
+                .status()
+                .expect("Failed to chown SSL file");
+        }
+    }
+
+    // --- Client cert (for mTLS, CN=pg_doorman) ---
+    let client_key_file = NamedTempFile::new().expect("Failed to create temp client key file");
+    let client_cert_file = NamedTempFile::new().expect("Failed to create temp client cert file");
+    let client_csr_file = NamedTempFile::new().expect("Failed to create temp client CSR file");
+    let client_key_path = client_key_file.path().to_str().unwrap().to_string();
+    let client_cert_path = client_cert_file.path().to_str().unwrap().to_string();
+    let client_csr_path = client_csr_file.path().to_str().unwrap().to_string();
+
+    run_openssl(&["genrsa", "-out", &client_key_path, "2048"]);
+    run_openssl(&[
+        "req",
+        "-new",
+        "-key",
+        &client_key_path,
+        "-out",
+        &client_csr_path,
+        "-subj",
+        "/CN=pg_doorman",
+    ]);
+    run_openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        &client_csr_path,
+        "-CA",
+        &ca_cert_path,
+        "-CAkey",
+        &ca_key_path,
+        "-CAcreateserial",
+        "-out",
+        &client_cert_path,
+        "-days",
+        "1",
+    ]);
+
+    // --- Wrong CA (independent CA that did NOT sign the server cert) ---
+    let wrong_ca_key_file = NamedTempFile::new().expect("Failed to create temp wrong CA key file");
+    let wrong_ca_cert_file =
+        NamedTempFile::new().expect("Failed to create temp wrong CA cert file");
+    let wrong_ca_key_path = wrong_ca_key_file.path().to_str().unwrap().to_string();
+    let wrong_ca_cert_path = wrong_ca_cert_file.path().to_str().unwrap().to_string();
+
+    run_openssl(&["genrsa", "-out", &wrong_ca_key_path, "2048"]);
+    run_openssl(&[
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        &wrong_ca_key_path,
+        "-out",
+        &wrong_ca_cert_path,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=WrongCA",
+    ]);
+
+    // NamedTempFile keeps files alive until dropped
+    world.pg_ssl_ca_key_file = Some(ca_key_file);
+    world.pg_ssl_ca_cert_file = Some(ca_cert_file);
+    world.pg_ssl_cert_file = Some(server_cert_file);
+    world.pg_ssl_key_file = Some(server_key_file);
+    world.pg_ssl_client_cert_file = Some(client_cert_file);
+    world.pg_ssl_client_key_file = Some(client_key_file);
+    world.pg_ssl_wrong_ca_cert_file = Some(wrong_ca_cert_file);
+}
+
+#[given("pooler hba file contains:")]
+pub async fn set_doorman_hba_file(world: &mut DoormanWorld, step: &Step) {
+    let hba_content = step
+        .docstring
+        .as_ref()
+        .expect("hba_content not found")
+        .to_string();
+
+    world.doorman_hba_file = Some(create_temp_file(&hba_content));
+}
+
+#[given("pooler started with config:")]
+#[given("pooler started with config:")]
+pub async fn start_doorman_with_config(world: &mut DoormanWorld, step: &Step) {
+    let content = step.docstring.as_ref().expect("config_content not found");
+    start_doorman_with_config_content(world, content).await;
+}
+
+pub async fn start_doorman_with_config_content(world: &mut DoormanWorld, config_content: &str) {
+    if let Some(ref mut child) = world.doorman_process {
+        stop_doorman(child);
+    }
+    world.doorman_process = None;
+
+    let config_content = config_content.to_string();
+
+    let doorman_port = pick_unused_port().expect("No free ports for pg_doorman");
+    world.doorman_port = Some(doorman_port);
+
+    let config_content = world.replace_placeholders(&config_content);
+
+    let config_file = create_config_file(&config_content);
+    let config_path = config_file.path().to_path_buf();
+    world.doorman_config_file = Some(config_file);
+
+    let doorman_binary = crate::utils::doorman_binary();
+    let log_level = if is_debug_mode() {
+        "debug"
+    } else {
+        "info"
+    };
+    let (stdout_cfg, stderr_cfg) = get_stdio_config();
+    // Per-scenario log capture: if `doorman_log_path` was set by an earlier
+    // `Given pg_doorman log capture enabled` step, redirect the child's stderr
+    // (where pg_doorman writes its log records) to that file. This lets later
+    // `Then pg_doorman log contains "..."` steps assert on log content.
+    let stderr_cfg = match world.doorman_log_path.as_ref() {
+        Some(path) => Stdio::from(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open doorman log capture file"),
+        ),
+        None => stderr_cfg,
+    };
+
+    let mut cmd = Command::new(doorman_binary);
+    cmd.arg(&config_path)
+        .arg("-l")
+        .arg(log_level)
+        .envs(
+            world
+                .doorman_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .stdout(stdout_cfg)
+        .stderr(stderr_cfg);
+
+    if world.doorman_nofile_limit.is_some() || world.doorman_extra_inheritable_pipes.is_some() {
+        use std::os::unix::process::CommandExt;
+        let nofile_limit = world.doorman_nofile_limit;
+        let extra_pipes = world.doorman_extra_inheritable_pipes.unwrap_or(0);
+        // SAFETY: pre_exec runs after fork and before exec. Keep this
+        // closure to async-signal-safe libc calls only.
+        // pipe(2) fds are inheritable by default; fcntl clears CLOEXEC
+        // defensively to preserve the polluted-parent fixture.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(limit) = nofile_limit {
+                    let rl = libc::rlimit {
+                        rlim_cur: limit as libc::rlim_t,
+                        rlim_max: limit as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                for _ in 0..extra_pipes {
+                    let mut fds: [libc::c_int; 2] = [-1, -1];
+                    if libc::pipe(fds.as_mut_ptr()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for fd in fds {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = cmd.spawn().expect("Failed to start pg_doorman");
+
+    world.doorman_process = Some(child);
+
+    let log_path = world.doorman_log_path.clone();
+    wait_for_doorman_ready(
+        doorman_port,
+        world.doorman_process.as_mut().unwrap(),
+        log_path.as_deref(),
+    )
+    .await;
+}
+
+/// Like `start_doorman_with_config`, but spawns pg_doorman with a tight
+/// `RLIMIT_NOFILE` soft limit applied via `pre_exec`. Used by migration-fd-budget
+/// scenarios that need to reproduce EMFILE pressure during binary upgrade.
+#[given(expr = "pg_doorman started with NOFILE limit {int} and config:")]
+pub async fn start_doorman_with_nofile_limit_and_config(
+    world: &mut DoormanWorld,
+    nofile_limit: u64,
+    step: &Step,
+) {
+    world.doorman_nofile_limit = Some(nofile_limit);
+    let content = step.docstring.as_ref().expect("config_content not found");
+    start_doorman_with_config_content(world, content).await;
+}
+
+/// Seed pg_doorman with inheritable pipe pairs so the SIGUSR2 child
+/// has unexpected fds to close.
+#[given(expr = "pg_doorman started with {int} extra inheritable pipes and config:")]
+pub async fn start_doorman_with_extra_inheritable_pipes(
+    world: &mut DoormanWorld,
+    pipes: usize,
+    step: &Step,
+) {
+    world.doorman_extra_inheritable_pipes = Some(pipes);
+    let content = step.docstring.as_ref().expect("config_content not found");
+    start_doorman_with_config_content(world, content).await;
+}
+
+/// Combined NOFILE + pipe pollution start. The low NOFILE keeps the
+/// inherited-fd cleanup range small enough for BDD.
+#[given(
+    expr = "pg_doorman started with NOFILE limit {int} and {int} extra inheritable pipes and config:"
+)]
+pub async fn start_doorman_with_nofile_limit_and_extra_inheritable_pipes(
+    world: &mut DoormanWorld,
+    nofile_limit: u64,
+    pipes: usize,
+    step: &Step,
+) {
+    world.doorman_nofile_limit = Some(nofile_limit);
+    world.doorman_extra_inheritable_pipes = Some(pipes);
+    let content = step.docstring.as_ref().expect("config_content not found");
+    start_doorman_with_config_content(world, content).await;
+}
+
+#[given("pooler shutdown-only mode")]
+pub async fn set_shutdown_only_mode(world: &mut DoormanWorld) {
+    world
+        .doorman_env
+        .push(("PG_DOORMAN_CI_SHUTDOWN_ONLY".into(), "1".into()));
+}
+
+/// Helper function to wait for pg_doorman to be ready (max 5 seconds)
+/// This is a custom implementation that captures logs on failure.
+///
+/// `log_path` is set when stderr was redirected to a file (log capture); the
+/// child's stderr is then `None`, so on failure we read from the file
+/// instead.
+pub(crate) async fn wait_for_doorman_ready(port: u16, child: &mut Child, log_path: Option<&Path>) {
+    use std::io::Read;
+
+    let read_captured_stderr = |buf: &mut String| {
+        if let Some(p) = log_path {
+            let _ = std::fs::File::open(p).and_then(|mut f| f.read_to_string(buf));
+        }
+    };
+
+    let mut success = false;
+    for _ in 0..20 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited, capture stdout and stderr (or log file)
+                let mut stdout_output = String::new();
+                let mut stderr_output = String::new();
+
+                if let Some(ref mut stdout) = child.stdout {
+                    let _ = stdout.read_to_string(&mut stdout_output);
+                }
+                if let Some(ref mut stderr) = child.stderr {
+                    let _ = stderr.read_to_string(&mut stderr_output);
+                } else {
+                    read_captured_stderr(&mut stderr_output);
+                }
+
+                panic!(
+                    "pg_doorman exited with status: {:?}\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
+                    status, stdout_output, stderr_output
+                );
+            }
+            Ok(None) => {
+                if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                    success = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                panic!("Error checking pg_doorman process: {:?}", e);
+            }
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    if !success {
+        let _ = child.kill();
+
+        let mut stdout_output = String::new();
+        let mut stderr_output = String::new();
+
+        if let Some(ref mut stdout) = child.stdout {
+            let _ = stdout.read_to_string(&mut stdout_output);
+        }
+        if let Some(ref mut stderr) = child.stderr {
+            let _ = stderr.read_to_string(&mut stderr_output);
+        } else {
+            read_captured_stderr(&mut stderr_output);
+        }
+
+        let _ = child.wait();
+
+        panic!(
+            "pg_doorman failed to start on port {} (timeout 5s)\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
+            port, stdout_output, stderr_output
+        );
+    }
+}
+
+/// Stop pg_doorman process (only if still running)
+pub fn stop_doorman(child: &mut Child) {
+    // Check if process has already exited
+    match child.try_wait() {
+        Ok(Some(_status)) => {
+            // Process already exited, just clean up pipes
+            drop(child.stdout.take());
+            drop(child.stderr.take());
+        }
+        Ok(None) => {
+            // Process still running, stop it
+            stop_process(child);
+        }
+        Err(_) => {
+            // Error checking status, try to stop anyway
+            stop_process(child);
+        }
+    }
+}
+
+/// Stop pg_doorman daemon by PID
+pub fn stop_doorman_daemon(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    // Wait a bit for process to terminate
+    std::thread::sleep(Duration::from_millis(100));
+}
+
+/// Check if a process is running by PID
+fn is_process_running(pid: u32) -> bool {
+    // kill(pid, 0) returns 0 for zombie processes, which gives false
+    // positives after binary upgrade: the old process has exited but
+    // its entry stays in the process table until the parent waits.
+    // Use waitpid(WNOHANG) to reap zombies, then retry kill.
+    unsafe {
+        let ret = libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+        if ret == pid as i32 {
+            return false; // reaped — process is gone
+        }
+        libc::kill(pid as i32, 0) == 0
+    }
+}
+
+/// Start pg_doorman in daemon mode with config content
+#[given("pooler started in daemon mode with config:")]
+pub async fn start_doorman_daemon_with_config(world: &mut DoormanWorld, step: &Step) {
+    // Stop any previously running pg_doorman daemon by reading PID from file
+    if let Some(ref pid_path) = world.doorman_daemon_pid_file {
+        if let Ok(pid_content) = std::fs::read_to_string(pid_path) {
+            if let Ok(pid) = pid_content.trim().parse::<u32>() {
+                stop_doorman_daemon(pid);
+            }
+        }
+    }
+    world.doorman_daemon_pid_file = None;
+
+    let config_content = step
+        .docstring
+        .as_ref()
+        .expect("config_content not found")
+        .trim()
+        .to_string();
+
+    let doorman_port = pick_unused_port().expect("No free ports for pg_doorman");
+    world.doorman_port = Some(doorman_port);
+
+    // Use centralized placeholder replacement
+    let config_content = world.replace_placeholders(&config_content);
+
+    // Create temp file with appropriate extension (required for pg_doorman config parsing)
+    let config_file = create_config_file(&config_content);
+    let config_path = config_file.path().to_path_buf();
+    world.doorman_config_file = Some(config_file);
+
+    let doorman_binary = crate::utils::doorman_binary();
+    let log_level = if is_debug_mode() { "debug" } else { "info" };
+
+    // Run with --daemon flag - parent process exits after daemon is ready
+    let output = Command::new(doorman_binary)
+        .arg(&config_path)
+        .arg("--daemon")
+        .arg("-l")
+        .arg(log_level)
+        .envs(
+            world
+                .doorman_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        )
+        .output()
+        .expect("Failed to start pg_doorman in daemon mode");
+
+    if !output.status.success() {
+        panic!(
+            "pg_doorman daemon failed to start (exit code: {:?}):\nstdout: {}\nstderr: {}\nconfig_path: {:?}\nconfig_content:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            config_path,
+            config_content
+        );
+    }
+
+    // Wait for port to be ready
+    wait_for_daemon_port_ready(doorman_port).await;
+
+    // Store daemon_pid_file path for cleanup (PID will be read from file in after hook)
+    // This handles binary-upgrade where PID changes
+    if let Some(pid_path) = extract_daemon_pid_file(&config_content) {
+        world.doorman_daemon_pid_file = Some(pid_path);
+    }
+}
+
+/// Extract daemon_pid_file path from config content
+fn extract_daemon_pid_file(config: &str) -> Option<String> {
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("daemon_pid_file") {
+            if let Some(value) = line.split('=').nth(1) {
+                return Some(value.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Helper function to wait for daemon port to be ready
+async fn wait_for_daemon_port_ready(port: u16) {
+    for _ in 0..20 {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "pg_doorman daemon failed to listen on port {} (timeout 5s)",
+        port
+    );
+}
+
+/// Check if PID file contains correct daemon PID
+/// Assert the permission bits on the pg_doorman Unix socket file match the
+/// expected octal mode. Uses the temp dir + doorman port the world already
+/// knows to locate the socket, so the step works for any scenario that
+/// configured `unix_socket_dir = "${PG_TEMP_DIR}"`.
+#[then(regex = r#"pooler unix socket file has mode "([0-7]{3,4})""#)]
+pub async fn verify_unix_socket_mode(world: &mut DoormanWorld, expected_mode: String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = world
+        .pg_tmp_dir
+        .as_ref()
+        .expect("pg_tmp_dir must be set")
+        .path();
+    let port = world.doorman_port.expect("doorman_port must be set");
+    let path = dir.join(format!(".s.PGSQL.{port}"));
+
+    let metadata =
+        std::fs::metadata(&path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    let actual_mode = metadata.permissions().mode() & 0o777;
+
+    let expected = u32::from_str_radix(expected_mode.trim_start_matches('0'), 8)
+        .expect("expected mode must be a valid octal literal");
+
+    assert_eq!(
+        actual_mode,
+        expected,
+        "unix socket {} has mode {:#o}, expected {:#o}",
+        path.display(),
+        actual_mode,
+        expected
+    );
+}
+
+#[then(regex = r#"PID file "([^"]+)" should contain running daemon PID"#)]
+pub async fn verify_pid_file(_world: &mut DoormanWorld, pid_path: String) {
+    let pid_content = std::fs::read_to_string(&pid_path).expect("Failed to read PID file");
+    let pid: u32 = pid_content
+        .trim()
+        .parse()
+        .expect("PID file should contain valid number");
+
+    assert!(
+        is_process_running(pid),
+        "PID {} in file should be a running process",
+        pid
+    );
+}
+
+/// Store current daemon PID for later comparison
+#[when(regex = r#"we store daemon PID from "([^"]+)" as "([^"]+)""#)]
+pub async fn store_daemon_pid(world: &mut DoormanWorld, pid_path: String, name: String) {
+    let pid_content = std::fs::read_to_string(&pid_path).expect("Failed to read PID file");
+    let pid: i32 = pid_content
+        .trim()
+        .parse()
+        .expect("PID file should contain valid number");
+
+    world
+        .named_backend_pids
+        .insert((name, "daemon_pid".to_string()), pid);
+}
+
+/// Send SIGINT to daemon for graceful reload (binary-upgrade)
+/// This only sends the signal, use "we wait for new daemon" step to wait for the new daemon
+#[when(regex = r#"we send SIGINT to daemon from PID file "([^"]+)""#)]
+pub async fn send_sigint_to_daemon(_world: &mut DoormanWorld, pid_path: String) {
+    let pid_content = std::fs::read_to_string(&pid_path).expect("Failed to read PID file");
+    let pid: i32 = pid_content
+        .trim()
+        .parse()
+        .expect("PID file should contain valid number");
+
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+}
+
+/// Verify that daemon PID has changed after graceful reload
+#[then(regex = r#"PID file "([^"]+)" should contain different PID than stored "([^"]+)""#)]
+pub async fn verify_pid_changed(_world: &mut DoormanWorld, pid_path: String, name: String) {
+    let pid_content = std::fs::read_to_string(&pid_path).expect("Failed to read PID file");
+    let current_pid: i32 = pid_content
+        .trim()
+        .parse()
+        .expect("PID file should contain valid number");
+
+    let old_pid = _world
+        .named_backend_pids
+        .get(&(name.clone(), "daemon_pid".to_string()))
+        .expect("Stored PID not found");
+
+    assert_ne!(
+        current_pid, *old_pid,
+        "PID should have changed after graceful reload (old: {}, current: {})",
+        old_pid, current_pid
+    );
+
+    assert!(
+        is_process_running(current_pid as u32),
+        "New PID {} should be a running process",
+        current_pid
+    );
+}
+
+/// Verify that a named session is connected
+#[then(regex = r#"session "([^"]+)" should be connected"#)]
+pub async fn verify_session_connected(world: &mut DoormanWorld, session_name: String) {
+    assert!(
+        world.named_sessions.contains_key(&session_name),
+        "Session '{}' should exist and be connected",
+        session_name
+    );
+}
+
+/// Verify that two stored PIDs are different
+/// PIDs are stored as (session_name, pid_name) -> pid in named_backend_pids
+#[then(regex = r#"stored PID "([^"]+)" should be different from "([^"]+)"#)]
+pub async fn verify_stored_pids_different(
+    world: &mut DoormanWorld,
+    pid1_name: String,
+    pid2_name: String,
+) {
+    // Find PID by pid_name (second element of the key tuple)
+    let pid1 = world
+        .named_backend_pids
+        .iter()
+        .find(|((_, name), _)| name == &pid1_name)
+        .map(|(_, pid)| *pid)
+        .unwrap_or_else(|| panic!("Stored PID '{}' not found in named_backend_pids", pid1_name));
+
+    let pid2 = world
+        .named_backend_pids
+        .iter()
+        .find(|((_, name), _)| name == &pid2_name)
+        .map(|(_, pid)| *pid)
+        .unwrap_or_else(|| panic!("Stored PID '{}' not found in named_backend_pids", pid2_name));
+
+    assert_ne!(
+        pid1, pid2,
+        "PIDs should be different: '{}' = {}, '{}' = {}",
+        pid1_name, pid1, pid2_name, pid2
+    );
+}
+
+/// Store current foreground pooler PID for later comparison
+#[when(regex = r#"we store foreground pooler PID as "([^"]+)""#)]
+pub async fn store_foreground_pid(world: &mut DoormanWorld, name: String) {
+    let pid = world
+        .doorman_process
+        .as_ref()
+        .expect("pg_doorman process not running")
+        .id() as i32;
+
+    world
+        .named_backend_pids
+        .insert((name, "foreground_pid".to_string()), pid);
+}
+
+/// Send SIGUSR2 to daemon for binary upgrade
+#[when(regex = r#"we send SIGUSR2 to daemon from PID file "([^"]+)""#)]
+pub async fn send_sigusr2_to_daemon(_world: &mut DoormanWorld, pid_path: String) {
+    let pid_content = std::fs::read_to_string(&pid_path).expect("Failed to read PID file");
+    let pid: i32 = pid_content
+        .trim()
+        .parse()
+        .expect("PID file should contain valid number");
+
+    unsafe {
+        libc::kill(pid, libc::SIGUSR2);
+    }
+}
+
+/// Send SIGUSR2 to foreground pooler for binary upgrade
+#[when("we send SIGUSR2 to foreground pooler")]
+pub async fn send_sigusr2_to_foreground(world: &mut DoormanWorld) {
+    let pid = world
+        .doorman_process
+        .as_ref()
+        .expect("pg_doorman process not running")
+        .id() as i32;
+
+    unsafe {
+        libc::kill(pid, libc::SIGUSR2);
+    }
+}
+
+/// Send SIGINT to foreground pooler for binary upgrade
+#[when("we send SIGINT to foreground pooler")]
+pub async fn send_sigint_to_foreground(world: &mut DoormanWorld) {
+    let pid = world
+        .doorman_process
+        .as_ref()
+        .expect("pg_doorman process not running")
+        .id() as i32;
+
+    unsafe {
+        libc::kill(pid, libc::SIGINT);
+    }
+}
+
+/// Wait for foreground pooler binary upgrade to complete (new process takes over)
+#[when("we wait for foreground binary upgrade to complete")]
+pub async fn wait_for_foreground_binary_upgrade(world: &mut DoormanWorld) {
+    let port = world.doorman_port.expect("doorman_port not set");
+
+    sleep(Duration::from_millis(2000)).await;
+
+    for _ in 0..20 {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            return;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    panic!(
+        "pg_doorman failed to complete binary upgrade on port {} (timeout 5s)",
+        port
+    );
+}
+
+/// Foreground upgrade keeps the service reachable after SIGUSR2.
+#[then(regex = r#"foreground pooler PID should be different from stored "([^"]+)""#)]
+pub async fn verify_foreground_pid_changed(world: &mut DoormanWorld, name: String) {
+    let port = world.doorman_port.expect("doorman_port not set");
+
+    let old_pid = world
+        .named_backend_pids
+        .get(&(name.clone(), "foreground_pid".to_string()))
+        .expect("Stored foreground PID not found");
+
+    // Foreground mode does not expose the replacement child PID to the harness.
+    // The contract here is availability across the handoff; the separate
+    // `stored foreground PID ... should not exist` step verifies old PID exit.
+    sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok(),
+        "New pg_doorman should be listening on port {}",
+        port
+    );
+
+    println!(
+        "Binary upgrade completed: old PID was {}, service still available on port {}",
+        old_pid, port
+    );
+}
+
+/// Verify that stored foreground pooler PID no longer exists (process terminated).
+/// Polls for up to 5 seconds since the old process needs time to detect zero clients
+/// and exit via the shutdown timer.
+#[then(regex = r#"stored foreground PID "([^"]+)" should not exist"#)]
+pub async fn verify_foreground_pid_not_exists(world: &mut DoormanWorld, name: String) {
+    let pid = world
+        .named_backend_pids
+        .get(&(name.clone(), "foreground_pid".to_string()))
+        .expect("Stored foreground PID not found");
+
+    // Budget: shutdown_timeout (5s in tests) does not start at SIGUSR2.
+    // It starts after binary_upgrade_and_shutdown() finishes setup:
+    //   ~0-10s  readiness handshake (select() on pipe, 10s max)
+    //   ~0s     MIGRATION_IN_PROGRESS = true, spawn sender task
+    //   then    spawn_shutdown_timer(shutdown_timeout) starts the clock
+    // In practice readiness takes ~2s, so the old process may live up to
+    // ~2s (setup) + 5s (shutdown_timeout) = ~7s after SIGUSR2.
+    // We poll for 10s (40 × 250ms) to have comfortable margin.
+    for _ in 0..40 {
+        if !is_process_running(*pid as u32) {
+            return;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    panic!("Process with PID {} should not exist after 10s", pid);
+}
+
+/// Overwrite the pg_doorman config file with new content (with placeholder substitution)
+#[when("we overwrite pooler config file with:")]
+pub async fn overwrite_config_file(world: &mut DoormanWorld, step: &Step) {
+    let content = step
+        .docstring
+        .as_ref()
+        .expect("Config content not found in docstring")
+        .to_string();
+
+    let content = world.replace_placeholders(&content);
+
+    let config_file = world
+        .doorman_config_file
+        .as_ref()
+        .expect("pg_doorman config file not found");
+
+    std::fs::write(config_file.path(), content).expect("Failed to overwrite config file");
+}
+
+/// Overwrite the pg_doorman config file with new invalid content
+#[when("we overwrite pooler config file with invalid content:")]
+pub async fn overwrite_config_with_invalid(world: &mut DoormanWorld, step: &Step) {
+    let invalid_content = step
+        .docstring
+        .as_ref()
+        .expect("Invalid config content not found in docstring")
+        .to_string();
+
+    let config_file = world
+        .doorman_config_file
+        .as_ref()
+        .expect("pg_doorman config file not found");
+
+    std::fs::write(config_file.path(), invalid_content).expect("Failed to overwrite config file");
+}
+
+/// Verify that pg_doorman PID has NOT changed (same process still running)
+#[then(regex = r#"foreground pooler PID should be same as stored "([^"]+)""#)]
+pub async fn verify_foreground_pid_same(world: &mut DoormanWorld, name: String) {
+    let stored_pid = world
+        .named_backend_pids
+        .get(&(name.clone(), "foreground_pid".to_string()))
+        .expect("Stored foreground PID not found");
+
+    if let Some(ref child) = world.doorman_process {
+        let current_pid = child.id() as i32;
+        assert_eq!(
+            *stored_pid, current_pid,
+            "PID should be same: stored '{}' = {}, current = {}",
+            name, stored_pid, current_pid
+        );
+    } else {
+        panic!("pg_doorman process not running");
+    }
+}

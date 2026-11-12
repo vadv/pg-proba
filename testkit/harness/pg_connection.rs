@@ -1,0 +1,804 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use base64::{engine::general_purpose, Engine as _};
+use hmac::{Hmac, Mac};
+use rand::Rng;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpStream;
+
+pub enum StreamKind {
+    Plain(TcpStream),
+    Tls(tokio_native_tls::TlsStream<TcpStream>),
+    /// Temporary state during TLS upgrade. Never used for I/O.
+    Upgrading,
+}
+
+impl AsyncRead for StreamKind {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            StreamKind::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            StreamKind::Upgrading => unreachable!("I/O on upgrading stream"),
+        }
+    }
+}
+
+impl AsyncWrite for StreamKind {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            StreamKind::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            StreamKind::Upgrading => unreachable!("I/O on upgrading stream"),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => Pin::new(s).poll_flush(cx),
+            StreamKind::Tls(s) => Pin::new(s).poll_flush(cx),
+            StreamKind::Upgrading => unreachable!("I/O on upgrading stream"),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            StreamKind::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            StreamKind::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            StreamKind::Upgrading => unreachable!("I/O on upgrading stream"),
+        }
+    }
+}
+
+pub struct PgConnection {
+    stream: StreamKind,
+    /// Process ID from BackendKeyData (used for cancel requests)
+    process_id: Option<i32>,
+    /// Secret key from BackendKeyData (used for cancel requests)
+    secret_key: Option<i32>,
+}
+
+impl PgConnection {
+    pub async fn connect(addr: &str) -> tokio::io::Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        Ok(Self {
+            stream: StreamKind::Plain(stream),
+            process_id: None,
+            secret_key: None,
+        })
+    }
+
+    /// Upgrade a plain TCP connection to TLS via PostgreSQL SSLRequest protocol.
+    /// Must be called after connect() and before send_startup().
+    pub async fn upgrade_to_tls(&mut self) -> tokio::io::Result<()> {
+        let mut tcp = match std::mem::replace(&mut self.stream, StreamKind::Upgrading) {
+            StreamKind::Plain(s) => s,
+            other => {
+                self.stream = other;
+                return Err(tokio::io::Error::other(
+                    "Connection is not in plain TCP state",
+                ));
+            }
+        };
+
+        // SSLRequest: length=8, code=80877103
+        let mut ssl_request = [0u8; 8];
+        ssl_request[..4].copy_from_slice(&8i32.to_be_bytes());
+        ssl_request[4..].copy_from_slice(&80877103i32.to_be_bytes());
+        tcp.write_all(&ssl_request).await?;
+
+        let response = tcp.read_u8().await?;
+        if response != b'S' {
+            self.stream = StreamKind::Plain(tcp);
+            return Err(tokio::io::Error::new(
+                tokio::io::ErrorKind::ConnectionRefused,
+                format!("Server refused TLS: '{}'", response as char),
+            ));
+        }
+
+        let connector = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .map_err(tokio::io::Error::other)?;
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+
+        let tls_stream = connector
+            .connect("localhost", tcp)
+            .await
+            .map_err(tokio::io::Error::other)?;
+
+        self.stream = StreamKind::Tls(tls_stream);
+        Ok(())
+    }
+
+    pub async fn send_startup(&mut self, user: &str, database: &str) -> tokio::io::Result<()> {
+        self.send_startup_with_params(user, database, &[]).await
+    }
+
+    /// Send a StartupMessage with extra key/value parameters after
+    /// `user` and `database`.
+    pub async fn send_startup_with_params(
+        &mut self,
+        user: &str,
+        database: &str,
+        extras: &[(&str, &str)],
+    ) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&196608i32.to_be_bytes()); // protocol version 3.0
+        msg.extend_from_slice(b"user\0");
+        msg.extend_from_slice(user.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(b"database\0");
+        msg.extend_from_slice(database.as_bytes());
+        msg.push(0);
+        for (key, value) in extras {
+            msg.extend_from_slice(key.as_bytes());
+            msg.push(0);
+            msg.extend_from_slice(value.as_bytes());
+            msg.push(0);
+        }
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn read_message(&mut self) -> tokio::io::Result<(char, Vec<u8>)> {
+        let mut header = [0u8; 5];
+        if let Err(e) = self.stream.read_exact(&mut header).await {
+            eprintln!("Failed to read message header: {}", e);
+            return Err(e);
+        }
+        let msg_type = header[0] as char;
+        let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if len < 4 {
+            panic!("Invalid message length: {}", len);
+        }
+        let mut data = vec![0u8; len - 4];
+        self.stream.read_exact(&mut data).await?;
+        Ok((msg_type, data))
+    }
+
+    pub async fn authenticate(&mut self, user: &str, password: &str) -> tokio::io::Result<()> {
+        loop {
+            let (msg_type, data) = self.read_message().await?;
+            match msg_type {
+                'R' => {
+                    let auth_type = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                    match auth_type {
+                        0 => {
+                            // AuthenticationOk
+                            continue;
+                        }
+                        3 => {
+                            // AuthenticationCleartextPassword
+                            self.send_password(password).await?;
+                        }
+                        5 => {
+                            // AuthenticationMD5Password
+                            let salt = &data[4..8];
+                            let hash = self.compute_md5_hash(user, password, salt);
+                            self.send_password(&hash).await?;
+                        }
+                        10 => {
+                            // AuthenticationSASL — start SCRAM-SHA-256
+                            // data contains mechanism list (null-terminated strings, double-null at end)
+                            let mechanisms = String::from_utf8_lossy(&data[4..]);
+                            assert!(
+                                mechanisms.contains("SCRAM-SHA-256"),
+                                "Server doesn't support SCRAM-SHA-256: {mechanisms}"
+                            );
+
+                            let nonce = Self::generate_nonce();
+                            let client_first_bare = format!("n=,r={nonce}");
+                            let client_first_message = format!("n,,{client_first_bare}");
+
+                            // Send SASLInitialResponse
+                            let mechanism = b"SCRAM-SHA-256\0";
+                            let response = client_first_message.as_bytes();
+                            let msg_len = 4 + mechanism.len() + 4 + response.len();
+                            let mut msg = Vec::new();
+                            msg.push(b'p');
+                            msg.extend_from_slice(&(msg_len as i32).to_be_bytes());
+                            msg.extend_from_slice(mechanism);
+                            msg.extend_from_slice(&(response.len() as i32).to_be_bytes());
+                            msg.extend_from_slice(response);
+                            self.stream.write_all(&msg).await?;
+
+                            // Read SASLContinue (auth_type=11)
+                            let (mt, d) = self.read_message().await?;
+                            assert_eq!(mt, 'R');
+                            let at = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+                            assert_eq!(at, 11, "Expected SASL_CONTINUE");
+                            let server_first = String::from_utf8_lossy(&d[4..]).to_string();
+
+                            // Parse server-first-message
+                            let (server_nonce, salt_b64, iterations) =
+                                Self::parse_server_first(&server_first);
+                            assert!(
+                                server_nonce.starts_with(&nonce),
+                                "Server nonce doesn't start with client nonce"
+                            );
+                            let salt = general_purpose::STANDARD
+                                .decode(&salt_b64)
+                                .expect("Invalid base64 salt");
+
+                            // Derive keys
+                            let salted_password =
+                                Self::scram_hi(password.as_bytes(), &salt, iterations);
+                            let client_key = Self::scram_hmac(&salted_password, b"Client Key");
+                            let stored_key = Sha256::digest(&client_key);
+                            let server_key = Self::scram_hmac(&salted_password, b"Server Key");
+
+                            // Build client-final-message-without-proof
+                            let cbind = general_purpose::STANDARD.encode(b"n,,");
+                            let client_final_without_proof = format!("c={cbind},r={server_nonce}");
+
+                            let auth_message = format!(
+                                "{client_first_bare},{server_first},{client_final_without_proof}"
+                            );
+
+                            let client_signature =
+                                Self::scram_hmac(&stored_key, auth_message.as_bytes());
+                            let mut client_proof = client_key.clone();
+                            for (p, s) in client_proof.iter_mut().zip(client_signature.iter()) {
+                                *p ^= s;
+                            }
+
+                            let client_final = format!(
+                                "{client_final_without_proof},p={}",
+                                general_purpose::STANDARD.encode(&client_proof)
+                            );
+
+                            // Send SASLResponse
+                            let response = client_final.as_bytes();
+                            let msg_len = 4 + response.len();
+                            let mut msg = Vec::new();
+                            msg.push(b'p');
+                            msg.extend_from_slice(&(msg_len as i32).to_be_bytes());
+                            msg.extend_from_slice(response);
+                            self.stream.write_all(&msg).await?;
+
+                            // Read SASLFinal (auth_type=12)
+                            let (mt, d) = self.read_message().await?;
+                            assert_eq!(mt, 'R');
+                            let at = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+                            assert_eq!(at, 12, "Expected SASL_FINAL");
+                            let server_final = String::from_utf8_lossy(&d[4..]).to_string();
+
+                            // Verify server signature
+                            let server_signature =
+                                Self::scram_hmac(&server_key, auth_message.as_bytes());
+                            let expected = format!(
+                                "v={}",
+                                general_purpose::STANDARD.encode(&server_signature)
+                            );
+                            assert_eq!(
+                                server_final, expected,
+                                "Server signature verification failed"
+                            );
+                        }
+                        _ => panic!("Unsupported auth type: {}", auth_type),
+                    }
+                }
+                'S' => continue, // ParameterStatus
+                'K' => {
+                    // BackendKeyData: process_id (4 bytes) + secret_key (4 bytes)
+                    if data.len() >= 8 {
+                        self.process_id =
+                            Some(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                        self.secret_key =
+                            Some(i32::from_be_bytes([data[4], data[5], data[6], data[7]]));
+                    }
+                    continue;
+                }
+                'Z' => {
+                    // ReadyForQuery
+                    if data[0] == b'I' {
+                        return Ok(());
+                    }
+                }
+                'E' => {
+                    panic!("Error during auth: {:?}", String::from_utf8_lossy(&data));
+                }
+                _ => {
+                    println!("Received message during auth: {} {:?}", msg_type, data);
+                }
+            }
+        }
+    }
+
+    async fn send_password(&mut self, password: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(password.as_bytes());
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'p');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    fn compute_md5_hash(&self, user: &str, password: &str, salt: &[u8]) -> String {
+        use md5::Digest;
+        let mut hasher = md5::Md5::new();
+        hasher.update(password.as_bytes());
+        hasher.update(user.as_bytes());
+        let res1 = hasher.finalize();
+        let hex1 = format!("{:x}", res1);
+
+        let mut hasher = md5::Md5::new();
+        hasher.update(hex1.as_bytes());
+        hasher.update(salt);
+        let res2 = hasher.finalize();
+        format!("md5{:x}", res2)
+    }
+
+    fn generate_nonce() -> String {
+        let mut rng = rand::rng();
+        (0..24)
+            .map(|_| {
+                let mut v = rng.random_range(0x21u8..0x7e);
+                if v == 0x2c {
+                    v = 0x7e;
+                }
+                v as char
+            })
+            .collect()
+    }
+
+    fn parse_server_first(msg: &str) -> (String, String, u32) {
+        let mut nonce = String::new();
+        let mut salt = String::new();
+        let mut iterations = 0u32;
+        for part in msg.split(',') {
+            if let Some(v) = part.strip_prefix("r=") {
+                nonce = v.to_string();
+            } else if let Some(v) = part.strip_prefix("s=") {
+                salt = v.to_string();
+            } else if let Some(v) = part.strip_prefix("i=") {
+                iterations = v.parse().expect("Invalid iteration count");
+            }
+        }
+        (nonce, salt, iterations)
+    }
+
+    fn scram_hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+        let password = match std::str::from_utf8(password) {
+            Ok(s) => match stringprep::saslprep(s) {
+                Ok(p) => p.into_owned().into_bytes(),
+                Err(_) => password.to_vec(),
+            },
+            Err(_) => password.to_vec(),
+        };
+        let mut hmac =
+            Hmac::<Sha256>::new_from_slice(&password).expect("HMAC accepts all key sizes");
+        hmac.update(salt);
+        hmac.update(&[0, 0, 0, 1]);
+        let mut prev = hmac.finalize().into_bytes();
+        let mut hi = prev;
+        for _ in 1..iterations {
+            let mut hmac =
+                Hmac::<Sha256>::new_from_slice(&password).expect("HMAC accepts all key sizes");
+            hmac.update(&prev);
+            prev = hmac.finalize().into_bytes();
+            for (h, p) in hi.iter_mut().zip(prev.iter()) {
+                *h ^= p;
+            }
+        }
+        hi.to_vec()
+    }
+
+    fn scram_hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut hmac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts all key sizes");
+        hmac.update(data);
+        hmac.finalize().into_bytes().to_vec()
+    }
+
+    /// Sends a Function Call ('F') message: the fastpath protocol path used by
+    /// `pgjdbc`'s Large Object API. `function_id` is the PostgreSQL function OID.
+    /// All args are sent in binary format as int4.
+    pub async fn send_function_call(
+        &mut self,
+        function_id: i32,
+        int_args: &[i32],
+    ) -> tokio::io::Result<()> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&function_id.to_be_bytes());
+        body.extend_from_slice(&1i16.to_be_bytes()); // arg format count
+        body.extend_from_slice(&1i16.to_be_bytes()); // binary format
+        body.extend_from_slice(&(int_args.len() as i16).to_be_bytes());
+        for arg in int_args {
+            body.extend_from_slice(&4i32.to_be_bytes());
+            body.extend_from_slice(&arg.to_be_bytes());
+        }
+        body.extend_from_slice(&1i16.to_be_bytes()); // result format binary
+
+        let len = (body.len() + 4) as i32;
+        let mut full_msg = Vec::with_capacity(1 + 4 + body.len());
+        full_msg.push(b'F');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(body);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_simple_query(&mut self, query: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(query.as_bytes());
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'Q');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_parse(&mut self, name: &str, query: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(query.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(&0i16.to_be_bytes()); // number of parameter data types (0)
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'P');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_bind(
+        &mut self,
+        portal: &str,
+        statement: &str,
+        params: Vec<Option<Vec<u8>>>,
+    ) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(portal.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(statement.as_bytes());
+        msg.push(0);
+
+        msg.extend_from_slice(&0i16.to_be_bytes()); // parameter format codes (0 for all strings)
+
+        msg.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for param in params {
+            match param {
+                Some(p) => {
+                    msg.extend_from_slice(&(p.len() as i32).to_be_bytes());
+                    msg.extend(p);
+                }
+                None => {
+                    msg.extend_from_slice(&(-1i32).to_be_bytes());
+                }
+            }
+        }
+
+        msg.extend_from_slice(&0i16.to_be_bytes()); // result-column format codes (0 for all strings)
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'B');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_describe(&mut self, target_type: char, name: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.push(target_type as u8);
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'D');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_execute(&mut self, portal: &str, max_rows: i32) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(portal.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(&max_rows.to_be_bytes());
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'E');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_sync(&mut self) -> tokio::io::Result<()> {
+        let mut full_msg = Vec::new();
+        full_msg.push(b'S');
+        full_msg.extend_from_slice(&4i32.to_be_bytes());
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_flush(&mut self) -> tokio::io::Result<()> {
+        let mut full_msg = Vec::new();
+        full_msg.push(b'H');
+        full_msg.extend_from_slice(&4i32.to_be_bytes());
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn send_close(&mut self, target_type: char, name: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.push(target_type as u8);
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'C');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    /// Send CopyData message ('d') - used during COPY FROM STDIN
+    pub async fn send_copy_data(&mut self, data: &[u8]) -> tokio::io::Result<()> {
+        let len = (data.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'd');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend_from_slice(data);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    /// Send CopyDone message ('c') - signals end of COPY FROM STDIN data
+    pub async fn send_copy_done(&mut self) -> tokio::io::Result<()> {
+        let mut full_msg = Vec::new();
+        full_msg.push(b'c');
+        full_msg.extend_from_slice(&4i32.to_be_bytes());
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    /// Send CopyFail message ('f') - signals COPY FROM STDIN failure
+    #[allow(dead_code)]
+    pub async fn send_copy_fail(&mut self, error_message: &str) -> tokio::io::Result<()> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(error_message.as_bytes());
+        msg.push(0);
+
+        let len = (msg.len() + 4) as i32;
+        let mut full_msg = Vec::new();
+        full_msg.push(b'f');
+        full_msg.extend_from_slice(&len.to_be_bytes());
+        full_msg.extend(msg);
+
+        self.stream.write_all(&full_msg).await?;
+        Ok(())
+    }
+
+    pub async fn read_all_messages_until_ready(
+        &mut self,
+    ) -> tokio::io::Result<Vec<(char, Vec<u8>)>> {
+        let mut messages = Vec::new();
+        loop {
+            let (msg_type, data) = self.read_message().await?;
+            if msg_type == 'Z' {
+                messages.push((msg_type, data));
+                break;
+            }
+            // For simple query comparison, we might want to ignore ParameterStatus (S)
+            // as they can be different or in different order
+            if msg_type != 'S' && msg_type != 'K' {
+                messages.push((msg_type, data));
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Read messages until ReadyForQuery, then continue reading any additional messages
+    /// (like ErrorResponse sent after transaction completion during shutdown)
+    pub async fn read_all_messages_until_ready_and_more(
+        &mut self,
+    ) -> tokio::io::Result<Vec<(char, Vec<u8>)>> {
+        let mut messages = Vec::new();
+        // First, read until ReadyForQuery
+        loop {
+            let (msg_type, data) = self.read_message().await?;
+            if msg_type != 'S' && msg_type != 'K' {
+                messages.push((msg_type, data.clone()));
+            }
+            if msg_type == 'Z' {
+                break;
+            }
+        }
+        // Then try to read any additional messages with a short timeout
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), self.read_message())
+                .await
+            {
+                Ok(Ok((msg_type, data))) => {
+                    if msg_type != 'S' && msg_type != 'K' {
+                        messages.push((msg_type, data));
+                    }
+                    // If we got ErrorResponse or another ReadyForQuery, we're done
+                    if msg_type == 'E' || msg_type == 'Z' {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break, // Connection error - stop reading
+                Err(_) => break,     // Timeout - no more messages
+            }
+        }
+        Ok(messages)
+    }
+
+    pub async fn read_partial_messages(&mut self) -> tokio::io::Result<Vec<(char, Vec<u8>)>> {
+        let mut messages = Vec::new();
+        // Read messages until we get at least one, but don't wait for ReadyForQuery
+        // Общий бюджет тишины: пир может вообще не ответить (pgbouncer после Flush) —
+        // без бюджета цикл опрашивает вечно и джоб виснет до CI-таймаута
+        let mut silent_ms: u64 = 0;
+        loop {
+            // Check if there's data available without blocking
+            match tokio::time::timeout(std::time::Duration::from_millis(100), self.read_message())
+                .await
+            {
+                Ok(Ok((msg_type, data))) => {
+                    silent_ms = 0;
+                    if msg_type == 'Z' {
+                        messages.push((msg_type, data));
+                        break;
+                    }
+                    if msg_type != 'S' && msg_type != 'K' {
+                        messages.push((msg_type, data));
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Timeout - no more messages available
+                    if !messages.is_empty() {
+                        break;
+                    }
+                    silent_ms += 100;
+                    if silent_ms >= 5000 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Abruptly close the connection (simulates network failure)
+    pub async fn abort_connection(self) {
+        drop(self.stream);
+    }
+
+    /// Send TCP RST instead of FIN. SO_LINGER with timeout=0 makes the kernel
+    /// send RST on close, which triggers BrokenPipe/ConnectionReset on the peer.
+    pub async fn abort_connection_with_rst(self) {
+        match self.stream {
+            StreamKind::Plain(s) => {
+                let std_stream = s.into_std().unwrap();
+                let linger = socket2::SockRef::from(&std_stream);
+                linger
+                    .set_linger(Some(std::time::Duration::from_secs(0)))
+                    .expect("Failed to set SO_LINGER");
+                drop(std_stream);
+            }
+            StreamKind::Tls(tls) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(tls.as_raw_fd()) };
+                    let linger = socket2::SockRef::from(&fd);
+                    linger
+                        .set_linger(Some(std::time::Duration::from_secs(0)))
+                        .expect("Failed to set SO_LINGER");
+                }
+                drop(tls);
+            }
+            StreamKind::Upgrading => unreachable!(),
+        }
+    }
+
+    /// Read a limited number of bytes from the stream (for partial read tests)
+    /// Returns the number of bytes actually read
+    pub async fn read_limited_bytes(&mut self, max_bytes: usize) -> tokio::io::Result<usize> {
+        let mut total_read = 0;
+        let mut buffer = vec![0u8; 8192]; // 8KB buffer
+
+        while total_read < max_bytes {
+            let to_read = std::cmp::min(buffer.len(), max_bytes - total_read);
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                self.stream.read(&mut buffer[..to_read]),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => {
+                    total_read += n;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // Timeout - no more data available
+            }
+        }
+        Ok(total_read)
+    }
+
+    /// Get the process ID from BackendKeyData (received during authentication)
+    pub fn get_process_id(&self) -> Option<i32> {
+        self.process_id
+    }
+
+    /// Get the secret key from BackendKeyData (received during authentication)
+    pub fn get_secret_key(&self) -> Option<i32> {
+        self.secret_key
+    }
+
+    /// Send a CancelRequest to the server
+    /// This creates a new connection, sends the cancel request, and closes it
+    /// Protocol: 16 bytes total - length (4) + cancel code (4) + process_id (4) + secret_key (4)
+    pub async fn send_cancel_request(
+        addr: &str,
+        process_id: i32,
+        secret_key: i32,
+    ) -> tokio::io::Result<()> {
+        let mut stream = TcpStream::connect(addr).await?;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&16i32.to_be_bytes()); // length = 16
+        msg.extend_from_slice(&80877102i32.to_be_bytes()); // CancelRequest code
+        msg.extend_from_slice(&process_id.to_be_bytes());
+        msg.extend_from_slice(&secret_key.to_be_bytes());
+
+        stream.write_all(&msg).await?;
+        // Server will close the connection after receiving cancel request
+        Ok(())
+    }
+}

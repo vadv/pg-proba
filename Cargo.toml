@@ -1,0 +1,37 @@
+[package]
+name = "pg-proba"
+version = "0.1.0"
+edition = "2021"
+description = "Transparency index for PostgreSQL connection poolers: one scenario per test, no weights"
+
+[[test]]
+harness = false
+name = "bdd"
+path = "testkit/harness/main.rs"
+
+[dev-dependencies]
+base64 = "0.22"
+chrono = "0.4"
+cucumber = "0.21"
+futures = "0.3"
+hmac = "0.12"
+jwt = { version = "0.16", features = ["openssl"] }
+libc = "0.2"
+log = "0.4"
+md-5 = "0.10"
+native-tls = "0.2"
+openssl = "0.10"
+portpicker = "0.1"
+rand = "0.9"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+stringprep = "0.1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "fs", "parking_lot", "sync", "io-util", "net", "macros", "signal", "time"] }
+tokio-native-tls = "0.3"
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "std"] }
