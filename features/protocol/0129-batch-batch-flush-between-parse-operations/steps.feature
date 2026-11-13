@@ -6,6 +6,7 @@ Feature: Batch: Flush between Parses after reconnect
   Flush forces delivery of each ParseComplete immediately, without
   Sync. Profile size1: pool_size=1, transaction mode — same server
   is reused after reconnect.
+  Upstream: pgbouncer/pgbouncer#1704 (reported 2026-11-13).
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
