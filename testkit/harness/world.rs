@@ -54,6 +54,7 @@ pub struct DoormanWorld {
     pub pgbouncer_port: Option<u16>,
     /// pgbouncer config file
     pub pgbouncer_config_file: Option<NamedTempFile>,
+    pub pgbouncer_log_path: Option<PathBuf>,
     /// pgbouncer userlist file (for authentication)
     pub pgbouncer_userlist_file: Option<NamedTempFile>,
     /// odyssey process handle
@@ -142,6 +143,16 @@ impl DoormanWorld {
         }
         if let Some(port) = self.odyssey_port {
             result = result.replace("${ODYSSEY_PORT}", &port.to_string());
+        }
+
+        if let Some(ref log_path) = self.pgbouncer_log_path {
+            result = result.replace("${PGBOUNCER_LOG}", log_path.to_str().unwrap());
+        }
+        if let Some(ref config_file) = self.pgbouncer_config_file {
+            result = result.replace(
+                "${PGBOUNCER_CONFIG}",
+                config_file.path().to_str().unwrap(),
+            );
         }
 
         // Replace temp dir placeholder (for unix_socket_dir)

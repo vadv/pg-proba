@@ -1,25 +1,21 @@
--- Подготовка PG для вендоренного upstream-сьюта pgbouncer
--- (testkit/upstream/pgbouncer/). Зеркалирует pg-fixture из upstream
--- conftest.py @ pgbouncer_1_26_1 — только то, что нужно 7 файлам.
-
-create database p0;
-create database p1;
-
-\c p0
-grant all on schema public to public;
-create table test_copy(i int);
-grant all on table test_copy to public;
-
-\c postgres
-create user bouncer;
-create user pswcheck with superuser createdb password 'pgbouncer-check';
-create user someuser with password 'anypasswd';
-set password_encryption to md5;
-create user puser1 password 'foo';
-create user puser2 password 'wrong';
-create user muser1 password 'foo';
-create user muser2 password 'wrong';
-set password_encryption to 'scram-sha-256';
-create user scramuser1 password 'foo';
-create user scramuser2 password 'wrong';
-create user scramuser3 password 'foo';
+-- PG fixtures for the vendored upstream pgbouncer suite
+-- (testkit/upstream/pgbouncer/). Mirrors the pg-fixture from upstream
+-- conftest.py @ pgbouncer_1_26_1, trimmed to what the seven vendored
+-- test files actually use (no p2..p7, no longpass/LDAP users).
+CREATE ROLE bouncer LOGIN;
+CREATE ROLE pswcheck LOGIN SUPERUSER CREATEDB PASSWORD 'pgbouncer-check';
+CREATE ROLE someuser LOGIN PASSWORD 'anypasswd';
+CREATE ROLE test_error_message_user LOGIN;
+SET password_encryption = 'md5';
+CREATE ROLE muser1 LOGIN PASSWORD 'foo';
+CREATE ROLE muser2 LOGIN PASSWORD 'wrong';
+CREATE ROLE puser1 LOGIN PASSWORD 'foo';
+CREATE ROLE puser2 LOGIN PASSWORD 'wrong';
+SET password_encryption = 'scram-sha-256';
+CREATE ROLE scramuser1 LOGIN PASSWORD 'SCRAM-SHA-256$4096:D76gvGUVj9Z4DNiGoabOBg==$RukL0Xo3Ql/2F9FsD7mcQ3GATG2fD3PA71qY1JagGDs=:BhKUwyyivFm7Tq2jDJVXSVRbRDgTWyBilZKgg6DDuYU=';
+CREATE DATABASE p0;
+CREATE DATABASE p1;
+\connect p0
+GRANT ALL ON SCHEMA public TO PUBLIC;
+CREATE TABLE test_copy(i int);
+GRANT ALL ON TABLE test_copy TO PUBLIC;

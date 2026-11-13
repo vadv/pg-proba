@@ -12,15 +12,19 @@ Supported by this adapter:
 - client connections through the pooler (conn/cur/sql/test/asleep/...)
 - bouncer.admin()/aadmin() via the real PgBouncer admin console
 - pg.connection_count()
+- runtime config rewrites: write_ini()/reset_ini()/run_with_config()
+  (inherited from utils.Bouncer; the harness renders the ini to a temp
+  file the pytest process can rewrite, and RELOAD goes through admin())
 
 Explicitly skipped (harness owns the process; slice 1 of the integration):
-- runtime config changes: bouncer.write_ini(), bouncer.run_with_config()
 - log inspection: bouncer.log_contains(), bouncer.print_logs()
 - network fault injection: pg.drop_traffic()/reject_traffic()/add_latency()
 - PostgreSQL lifecycle: pg.restart()/arestart()/stop()/reload()/delayed_start()/configure()
 """
 
 import os
+import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -79,14 +83,24 @@ class HarnessBouncer(Bouncer):
         # Attributes some vendored tests touch directly before we get a
         # chance to skip them (test_operations, test_timeouts).
         self.config_dir = Path("/tmp")
-        self.ini_path = self.config_dir / "pgbouncer-upstream-unused.ini"
-        self.log_path = self.config_dir / "pgbouncer-upstream-unused.log"
+        # The harness exports the real running config and log paths of the
+        # pooler it started (see steps.feature: ${PGBOUNCER_CONFIG}/
+        # ${PGBOUNCER_LOG}); tests that edit the ini and admin("reload") or
+        # assert on log lines work against the real instance.
+        self.ini_path = Path(os.environ.get("PGBOUNCER_INI", "/tmp/pgbouncer-upstream-unused.ini"))
+        self.log_path = Path(os.environ.get("PGBOUNCER_LOG", "/tmp/pgbouncer-upstream-unused.log"))
         # Admin console over TCP (unix_socket_dir is empty in our configs).
         self.admin_host = "127.0.0.1"
         self.admin_runner = QueryRunner("127.0.0.1", int(os.environ["POOLER_PORT"]))
         self.admin_runner.default_db = "pgbouncer"
         self.admin_runner.default_user = "pgbouncer"
         self.admin_runner.default_password = "fake"
+        self.auth_path = Path(
+            os.environ.get(
+                "PGBOUNCER_USERLIST",
+                "/tmp/pgbouncer-upstream-unused.userlist",
+            )
+        )
 
     # -- runtime config / logs: harness-owned process, skip cleanly ------
     def write_ini(self, config):
@@ -95,11 +109,38 @@ class HarnessBouncer(Bouncer):
     def run_with_config(self, config):
         _skip("bouncer.run_with_config()")
 
+    @contextmanager
     def log_contains(self, re_string, times=None):
-        _skip("bouncer.log_contains()")
+        """Same contract as upstream: log lines matching re_string must
+        appear while the with-block runs (assert on exit, like upstream)."""
+        with self.log_path.open() as f:
+            f.seek(0, os.SEEK_END)
+            yield
+            content = f.read()
+        if times is None:
+            assert re.search(re_string, content), (
+                f"pattern {re_string!r} not found in pooler log after the block; "
+                f"tail: {content[-2000:]!r}"
+            )
+        else:
+            match_count = len(re.findall(re_string, content))
+            assert match_count == times, (
+                f"pattern {re_string!r} matched {match_count} times, want {times}; "
+                f"tail: {content[-2000:]!r}"
+            )
 
     def print_logs(self):
-        print("(pooler log goes to the harness stdout; no log file in this adapter)")
+        try:
+            tail = self.log_path.read_text()[-4000:]
+            print(f"=== pooler log tail ({self.log_path}) ===\n{tail}")
+        except OSError as e:
+            print(f"(no pooler log at {self.log_path}: {e})")
+
+
+def pytest_configure(config):
+    # upstream marks used by the vendored files (avoids
+    # PytestUnknownMarkWarning; upstream registers them in pytest.ini)
+    config.addinivalue_line("markers", "md5: md5-specific fixture variant")
 
 
 @pytest.fixture(scope="session")
