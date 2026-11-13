@@ -67,7 +67,8 @@ fn main() {
             std::env::var("FEATURES").unwrap_or_else(|_| "features".to_string());
         let writer = DoormanWorld::cucumber()
             .max_concurrent_scenarios(1)
-            .fail_fast()
+            // fail_fast убран: в матрице 102 пер-тестовых сценариев первый красный
+            // не должен скрывать остальные (триаж должен видеть полную картину).
             .with_cli(cli)
             .before(|feature, _rule, scenario, world| {
                 Box::pin(async move {

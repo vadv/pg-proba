@@ -58,6 +58,7 @@ pub async fn start_pgbouncer_with_config_content(world: &mut DoormanWorld, confi
 
     // If running as root, make config file readable by postgres user
     if is_root() {
+        set_file_permissions(&log_path, 0o666);
         set_file_permissions(&config_path, 0o644);
 
         // Also ensure SSL files are readable if they exist

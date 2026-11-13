@@ -1,0 +1,207 @@
+# Translation of the upstream PgBouncer suite profile (testkit/configs/upstream)
+# for pg_doorman. Semantics follow upstream test.ini of pgbouncer_1_26_1:
+#   p0  pool_size 2 + reserve 2 (statement mode; doorman has no statement
+#       pooling, transaction is the closest mode; p3 keeps session parity)
+#   p1  plain pool
+#   p2  max_db_connections 4
+#   p3  session mode
+#   p3x transaction mode
+#   p9  server_lifetime 2s (doorman takes milliseconds)
+# varcache_change (client_encoding=SQL_ASCII) has no doorman equivalent;
+# tests relying on it fail visibly - that is matrix data, not a hidden gap.
+
+[general]
+host = "127.0.0.1"
+port = ${DOORMAN_PORT}
+admin_username = "pgbouncer"
+admin_password = "fake"
+pg_hba.content = "host all all 127.0.0.1/32 trust"
+
+
+[pools.p0]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "transaction"
+
+[[pools.p0.users]]
+username = "bouncer"
+password = ""
+pool_size = 2
+
+[[pools.p0.users]]
+username = "postgres"
+password = ""
+pool_size = 2
+
+[[pools.p0.users]]
+username = "puser1"
+password = ""
+pool_size = 2
+
+[[pools.p0.users]]
+username = "puser2"
+password = ""
+pool_size = 2
+
+[[pools.p0.users]]
+username = "puser3"
+password = ""
+pool_size = 2
+
+[pools.p1]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "transaction"
+
+[[pools.p1.users]]
+username = "bouncer"
+password = ""
+pool_size = 5
+
+[[pools.p1.users]]
+username = "postgres"
+password = ""
+pool_size = 5
+
+[[pools.p1.users]]
+username = "puser1"
+password = ""
+pool_size = 5
+
+[[pools.p1.users]]
+username = "puser2"
+password = ""
+pool_size = 5
+
+[[pools.p1.users]]
+username = "puser3"
+password = ""
+pool_size = 5
+
+[pools.p2]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "transaction"
+max_db_connections = 4
+
+[[pools.p2.users]]
+username = "bouncer"
+password = ""
+pool_size = 5
+
+[[pools.p2.users]]
+username = "postgres"
+password = ""
+pool_size = 5
+
+[[pools.p2.users]]
+username = "puser1"
+password = ""
+pool_size = 5
+
+[[pools.p2.users]]
+username = "puser2"
+password = ""
+pool_size = 5
+
+[[pools.p2.users]]
+username = "puser3"
+password = ""
+pool_size = 5
+
+[pools.p3]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "session"
+
+[[pools.p3.users]]
+username = "bouncer"
+password = ""
+pool_size = 5
+
+[[pools.p3.users]]
+username = "postgres"
+password = ""
+pool_size = 5
+
+[[pools.p3.users]]
+username = "puser1"
+password = ""
+pool_size = 5
+
+[[pools.p3.users]]
+username = "puser2"
+password = ""
+pool_size = 5
+
+[[pools.p3.users]]
+username = "puser3"
+password = ""
+pool_size = 5
+
+[pools.p3x]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "transaction"
+
+[[pools.p3x.users]]
+username = "bouncer"
+password = ""
+pool_size = 5
+
+[[pools.p3x.users]]
+username = "postgres"
+password = ""
+pool_size = 5
+
+[[pools.p3x.users]]
+username = "puser1"
+password = ""
+pool_size = 5
+
+[[pools.p3x.users]]
+username = "puser2"
+password = ""
+pool_size = 5
+
+[[pools.p3x.users]]
+username = "puser3"
+password = ""
+pool_size = 5
+
+[pools.p9]
+server_host = "127.0.0.1"
+server_port = ${PG_PORT}
+server_tls_mode = "disable"
+pool_mode = "transaction"
+server_lifetime = 2000
+
+[[pools.p9.users]]
+username = "bouncer"
+password = ""
+pool_size = 5
+
+[[pools.p9.users]]
+username = "postgres"
+password = ""
+pool_size = 5
+
+[[pools.p9.users]]
+username = "puser1"
+password = ""
+pool_size = 5
+
+[[pools.p9.users]]
+username = "puser2"
+password = ""
+pool_size = 5
+
+[[pools.p9.users]]
+username = "puser3"
+password = ""
+pool_size = 5

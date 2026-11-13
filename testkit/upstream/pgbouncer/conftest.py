@@ -1,23 +1,26 @@
 """pg-proba adapter for the vendored upstream PgBouncer test suite.
 
 Files in this directory are vendored verbatim from the pgbouncer tag
-pgbouncer_1_26_1 (see VENDORED.md).  Upstream's own conftest.py spawns a
-private PostgreSQL and PgBouncer per test run; here both are started by
-the pg-proba cucumber harness before the pytest process is launched
-(see features/upstream/0001-pgbouncer-upstream-python-suite/steps.feature),
+pgbouncer_1_26_1 (upstream: test/ in the pgbouncer repository).  Upstream's
+own conftest.py spawns a private PostgreSQL and PgBouncer per test run;
+here both are started by the pg-proba cucumber harness before the pytest
+process is launched (see features/upstream/0001-pgbouncer-upstream-python-suite/),
 so the ``pg`` and ``bouncer`` fixtures below bind to the already running
 instances instead of creating them.
 
 Supported by this adapter:
 - client connections through the pooler (conn/cur/sql/test/asleep/...)
-- bouncer.admin()/aadmin() via the real PgBouncer admin console
+- bouncer.admin()/aadmin() via the admin console (PgBouncer SQL console;
+  pg_doorman accepts the same "pgbouncer" admin database)
 - pg.connection_count()
 - runtime config rewrites: write_ini()/reset_ini()/run_with_config()
-  (inherited from utils.Bouncer; the harness renders the ini to a temp
-  file the pytest process can rewrite, and RELOAD goes through admin())
+  (inherited from utils.Bouncer; the harness renders the config to a
+  real file the pytest process can rewrite, and RELOAD goes through
+  admin()) - PgBouncer and pg_doorman only, guarded on POOLER
+- log inspection: bouncer.log_contains()/print_logs() against the
+  harness-exposed log file
 
-Explicitly skipped (harness owns the process; slice 1 of the integration):
-- log inspection: bouncer.log_contains(), bouncer.print_logs()
+Explicitly skipped (harness owns the process):
 - network fault injection: pg.drop_traffic()/reject_traffic()/add_latency()
 - PostgreSQL lifecycle: pg.restart()/arestart()/stop()/reload()/delayed_start()/configure()
 """
@@ -102,17 +105,42 @@ class HarnessBouncer(Bouncer):
             )
         )
 
-    # -- runtime config / logs: harness-owned process, skip cleanly ------
+    # -- runtime config / logs -----------------------------------------
+    # write_ini/reset_ini/run_with_config are inherited from utils.Bouncer
+    # and work against the real config file + admin RELOAD - but only on
+    # poolers whose config is an ini (PgBouncer).
+    def _require_ini_pooler(self, what):
+        if os.environ.get("POOLER") != "pgbouncer":
+            _skip(f"{what}: ini config rewrites only apply to PgBouncer")
+
     def write_ini(self, config):
-        _skip("bouncer.write_ini()")
+        self._require_ini_pooler("bouncer.write_ini()")
+        return super().write_ini(config)
+
+    def reset_ini(self):
+        self._require_ini_pooler("bouncer.reset_ini()")
+        return super().reset_ini()
 
     def run_with_config(self, config):
-        _skip("bouncer.run_with_config()")
+        self._require_ini_pooler("bouncer.run_with_config()")
+        return super().run_with_config(config)
+
+    def admin(self, query, **kwargs):
+        if os.environ.get("POOLER") == "odyssey":
+            _skip("bouncer.admin(): Odyssey has no SQL admin console")
+        return super().admin(query, **kwargs)
+
+    def aadmin(self, query, **kwargs):
+        if os.environ.get("POOLER") == "odyssey":
+            _skip("bouncer.aadmin(): Odyssey has no SQL admin console")
+        return super().aadmin(query, **kwargs)
 
     @contextmanager
     def log_contains(self, re_string, times=None):
         """Same contract as upstream: log lines matching re_string must
         appear while the with-block runs (assert on exit, like upstream)."""
+        if os.environ.get("POOLER") != "pgbouncer":
+            _skip("bouncer.log_contains(): log file only exposed for PgBouncer")
         with self.log_path.open() as f:
             f.seek(0, os.SEEK_END)
             yield
@@ -130,6 +158,8 @@ class HarnessBouncer(Bouncer):
             )
 
     def print_logs(self):
+        if os.environ.get("POOLER") != "pgbouncer":
+            return
         try:
             tail = self.log_path.read_text()[-4000:]
             print(f"=== pooler log tail ({self.log_path}) ===\n{tail}")
@@ -150,6 +180,4 @@ def pg():
 
 @pytest.fixture
 def bouncer(pg):
-    if os.environ.get("POOLER", "pgbouncer") != "pgbouncer":
-        pytest.skip("upstream suite is wired for pgbouncer only (slice 1)")
     return HarnessBouncer(pg)
