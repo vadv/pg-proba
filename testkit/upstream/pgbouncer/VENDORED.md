@@ -6,6 +6,8 @@
 ## Что скопировано (без изменений)
 
 - `__init__.py`, `utils.py`
+- `../include/bouncer.h` → `testkit/upstream/include/bouncer.h`
+  (читается `utils.py` при импорте: `#define MAX_PASSWORD 65531`)
 - `test_prepared.py`, `test_copy.py`, `test_cancel.py`, `test_operations.py`,
   `test_timeouts.py`, `test_no_database.py`, `test_no_user.py`
 
