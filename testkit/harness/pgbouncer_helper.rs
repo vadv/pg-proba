@@ -1,5 +1,6 @@
 use crate::service_helper::{stop_process_immediate, wait_for_service_ready};
-use crate::utils::{create_temp_file, get_stdio_config, is_root, set_file_permissions};
+use crate::utils::{create_temp_file, is_root, set_file_permissions};
+use std::process::Stdio;
 use crate::world::DoormanWorld;
 use cucumber::{gherkin::Step, given};
 use portpicker::pick_unused_port;
@@ -37,15 +38,27 @@ pub async fn start_pgbouncer_with_config_content(world: &mut DoormanWorld, confi
 
     // Set port temporarily for placeholder replacement
     world.pgbouncer_port = Some(pgbouncer_port);
-    // Алиас: клиентские шаги цепляются к doorman_port как «порт пулера под тестом»
+    // Alias: client steps attach to doorman_port as "the pooler under test".
     world.doorman_port = Some(pgbouncer_port);
     let config_content = world.replace_placeholders(&config_content);
 
     let config_file = create_temp_file(&config_content);
     let config_path = config_file.path().to_path_buf();
 
+    // Redirect pgbouncer stderr into a per-run log file: upstream suite's
+    // bouncer.log_contains() reads the pooler log; path is exported to the
+    // pytest process via the ${PGBOUNCER_LOG} placeholder.
+    let log_path = std::env::temp_dir().join(format!("pgbouncer-{pgbouncer_port}.log"));
+    let _ = std::fs::remove_file(&log_path);
+    let log_file = std::fs::File::create(&log_path).expect("Failed to create pgbouncer log file");
+    let log_file_err = log_file
+        .try_clone()
+        .expect("Failed to duplicate pgbouncer log file handle");
+    world.pgbouncer_log_path = Some(log_path.clone());
+
     // If running as root, make config file readable by postgres user
     if is_root() {
+        set_file_permissions(&log_path, 0o666);
         set_file_permissions(&config_path, 0o644);
 
         // Also ensure SSL files are readable if they exist
@@ -63,7 +76,8 @@ pub async fn start_pgbouncer_with_config_content(world: &mut DoormanWorld, confi
 
     world.pgbouncer_config_file = Some(config_file);
 
-    let (stdout_cfg, stderr_cfg) = get_stdio_config();
+    let stdout_cfg = Stdio::from(log_file);
+    let stderr_cfg = Stdio::from(log_file_err);
 
     // PgBouncer refuses to run as root, so we need to run it as postgres user
     let child = if is_root() {

@@ -67,7 +67,6 @@ fn main() {
             std::env::var("FEATURES").unwrap_or_else(|_| "features".to_string());
         let writer = DoormanWorld::cucumber()
             .max_concurrent_scenarios(1)
-            .fail_fast()
             .with_cli(cli)
             .before(|feature, _rule, scenario, world| {
                 Box::pin(async move {
