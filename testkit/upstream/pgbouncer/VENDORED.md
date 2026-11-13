@@ -32,3 +32,4 @@ $ cp pgbouncer/test/{__init__,utils,test_prepared,test_copy,test_cancel,test_ope
 версией между собой. После обновления — прогнать
 `env/run.sh test pgbouncer features/upstream/0001-*/steps.feature` и
 разобрать падения.
+- `../build/test_config.h` → `testkit/upstream/build/test_config.h` (meson-style флаги сборки: TLS yes, LDAP no — по факту бинарника в образе; читается `utils.py` при импорте)
