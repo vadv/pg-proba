@@ -1,26 +1,15 @@
 # pg-proba
 
-Every pooler faces the proba. The proba is PostgreSQL itself.
+Differential test suite for PostgreSQL connection poolers (PgBouncer, Odyssey, pg_doorman).
 
-Differential correctness engine for PostgreSQL connection poolers. Each test compares
-pooler behavior with a direct connection to PostgreSQL. PgBouncer, Odyssey,
-and pg_doorman run the same suite of tests. The result is an honest summary:
-what each pooler does correctly, and what it does not.
+246 protocol and driver scenarios run identically against each pooler in transaction mode
+(with prepared statement caching enabled) and against direct PostgreSQL 16 as the reference.
 
-## Method
+## How it works
 
-A test passes when the pooler is not distinguishable from direct
-PostgreSQL: same protocol, same answers, same state. Each difference is
-RED. A RED result is an observation, not a verdict. The pooler can have
-a design reason for the difference.
-
-- One test is one file. `features/<category>/NNNN-slug/steps.feature` holds
-  the scenario and the full configs of all three poolers. The harness
-  substitutes the ports automatically.
-- Scenarios read as text. Each step is a natural-language sentence
-  (`When I run shell command…`, `Then the command should succeed`).
-  The pooler config is visible in the scenario, not hidden in a render.
-- One engine runs all poolers. A Rust cucumber harness executes the steps.
+- **Two test layers**: wire-level extended query protocol assertions (Parse/Bind/Execute/Flush/Sync parity with direct PG) and real client drivers (`libpq`, `psycopg2`/`psycopg3`, `pgjdbc`, `Npgsql`, `pgx`, `node-postgres`, `PDO`).
+- **Self-contained scenarios**: each `features/<category>/NNNN-slug/steps.feature` defines the exact workload and pooler config profile.
+- **Reproducible environment**: PostgreSQL, all three poolers, and all language runtimes are pinned in a single Nix flake (`env/flake.lock`).
 
 ## Results
 
@@ -37,13 +26,13 @@ The matrix runs on each push.
 
 | Test | odyssey | pgbouncer | pg_doorman |
 |---|---|---|---|
-| [0129](features/protocol/0129-batch-batch-flush-between-parse-operations/steps.feature) psycopg3/libpq pipeline re-Prepare of a tracked name on a reused server connection: pgbouncer holds ParseComplete back until Sync, the pipeline hangs (direct PG answers in <1 ms; upstream [pgbouncer#1704](https://github.com/pgbouncer/pgbouncer/issues/1704)). Threat: prepared statement preparation deadlocks behind the pooler | ✓ | ✗ | ✓ |
-| [0141](features/session-state/0141-pcsp-bug-2-sticky-reset-fires/steps.feature) a startup parameter of client 1 (search_path in this test) survives to client 2 on the same server connection. Odyssey resets it only with pool_smart_discard=yes (off by default). Threat: the next client reads data through the previous client's settings, silent data corruption | ✗ | ✓ | ✓ |
-| [0142](features/session-state/0142-pcsp-bug-3-parse-error-does/steps.feature) re-Parse of the same name after a failed Parse: pgbouncer disconnects the client with "prepared statement name is already in use" ([pgbouncer#1630](https://github.com/pgbouncer/pgbouncer/issues/1630)). Threat: a legal driver retry kills the session | ✓ | ✗ | ✓ |
-| [0173](features/session-state/0173-dcc-deallocate-specific-statement-clears-only/steps.feature) DEALLOCATE by name through a SimpleQuery: pgbouncer answers 26000 and disconnects, it maps only DEALLOCATE ALL and DISCARD ALL (src/server.c) ([pgbouncer#1705](https://github.com/pgbouncer/pgbouncer/issues/1705)). Threat: session dies on a plain DEALLOCATE. Note: pg_doorman answers CommandComplete but leaks the server-side statement | ✓ | ✗ | ✓ |
-| [0226](features/lang-compiled/0226-run-net-multi-session-tests/steps.feature) Npgsql, 5 parallel connections with 20 prepared executes each: pgbouncer loses mapped statements, FATAL 08P01 "prepared statement did not exist". Deterministic single connection repro: DISCARD ALL pipelined with the next PREPARE, pgbouncer drops the new statement and kills the session (upstream [pgbouncer#1706](https://github.com/pgbouncer/pgbouncer/issues/1706)). Threat: prepared queries of random clients start failing | ✓ | ✗ | ✓ |
-| [0248](features/lang-jvm-script/0248-run-java-aggressive-mixed-tests-batch-prepared-statements-ex/steps.feature) pgjdbc batch INSERT with an expected 23505, then ROLLBACK: odyssey drops its name mapping on the error, the retry Bind reaches the server unmapped and dies 26000 before ROLLBACK runs, the next round hits the duplicate key. Deterministic single connection repro: an explicit BEGIN, the expected 23505, then a repeated Bind of the same name gives 26000 instead of 25P02 (upstream [odyssey#1840](https://github.com/yandex/odyssey/issues/1840)). Threat: no transaction recovery after a batch error | ✗ | ✓ | ✓ |
-| [0254](features/lang-jvm-script/0254-run-python-session-cursors-tests/steps.feature) psycopg2 CURSOR WITH HOLD: the cursor outlives its client and becomes visible to the NEXT client. Direct PG destroys it at session end. Both projects document "no session features" but not the cross-client visibility ([pgbouncer#976](https://github.com/pgbouncer/pgbouncer/issues/976)). Threat: session objects leak between clients | ✗ | ✗ | ✓ |
+| [0129](features/protocol/0129-batch-batch-flush-between-parse-operations/steps.feature) **Pipeline `Parse` + `Flush` hangs**: when a client sends `Parse` followed by `Flush` (no `Sync`) for an already-cached statement, PgBouncer swallows `Parse`, emits a synthetic `ParseComplete` into `client->sbuf`, and never flushes it until `Sync`. Clients waiting on `Flush` before sending `Bind` deadlock ([pgbouncer#1704](https://github.com/pgbouncer/pgbouncer/issues/1704)). | ✓ | ✗ | ✓ |
+| [0141](features/session-state/0141-pcsp-bug-2-sticky-reset-fires/steps.feature) **Startup `search_path` leaks between clients**: startup parameters set in the initial packet by client 1 persist on the backend connection for client 2 unless `pool_smart_discard = yes` (disabled by default; `pool_discard` cannot be combined with `pool_reserve_prepared_statement`). | ✗ | ✓ | ✓ |
+| [0142](features/session-state/0142-pcsp-bug-3-parse-error-does/steps.feature) **Re-`Parse` after a failed `Parse` drops the connection**: PgBouncer registers the statement name before backend `Parse` completes; when the backend returns an error (`42P01`), a subsequent `Parse` with the same name fails in PgBouncer with `prepared statement name is already in use` and disconnects the client ([pgbouncer#1630](https://github.com/pgbouncer/pgbouncer/issues/1630)). | ✓ | ✗ | ✓ |
+| [0173](features/session-state/0173-dcc-deallocate-specific-statement-clears-only/steps.feature) **SQL `DEALLOCATE <name>` desynchronizes statement cache**: `src/server.c` tracks only `DEALLOCATE ALL` / `DISCARD ALL` command tags. A targeted `DEALLOCATE name` removes the statement on PostgreSQL while PgBouncer keeps the cache entry, so the next reuse skips `Parse` and fails with `26000` ([pgbouncer#1705](https://github.com/pgbouncer/pgbouncer/issues/1705)). *(Note: `pg_doorman` intercepts `DEALLOCATE name` with a synthetic `CommandComplete` without freeing the backend statement.)* | ✓ | ✗ | ✓ |
+| [0226](features/lang-compiled/0226-run-net-multi-session-tests/steps.feature) **`DISCARD ALL` pipelined with `Parse` drops the new statement**: when `SimpleQuery("DISCARD ALL")` is sent in the same TCP batch as the next extended-protocol `Parse` (Npgsql connection reset pattern), PgBouncer registers the new statement while `DISCARD ALL` is still in flight; the arriving `DISCARD ALL` `CommandComplete` wipes the freshly registered entry (`src/server.c:218`), causing `08P01` (`prepared statement did not exist`) and disconnect ([pgbouncer#1706](https://github.com/pgbouncer/pgbouncer/issues/1706)). | ✓ | ✗ | ✓ |
+| [0248](features/lang-jvm-script/0248-run-java-aggressive-mixed-tests-batch-prepared-statements-ex/steps.feature) **Prepared statement lost on backend execution error**: when a batch/statement inside an explicit transaction hits a constraint error (e.g. `23505`), Odyssey drops the statement from its server-side map while injecting virtual `ParseComplete` on retry (`OD_XPLAN_VIRTUAL_PARSE_COMPLETE`), sending an unparsed `Bind` that fails with `26000` instead of `25P02` ([odyssey#1840](https://github.com/yandex/odyssey/issues/1840)). | ✗ | ✓ | ✓ |
+| [0254](features/lang-jvm-script/0254-run-python-session-cursors-tests/steps.feature) **`DECLARE ... CURSOR WITH HOLD` leaks across clients**: in transaction pooling without `server_reset_query` / `DISCARD ALL`, a holdable cursor created by client 1 remains open in `pg_cursors` and readable by client 2 on the reused backend connection ([pgbouncer#976](https://github.com/pgbouncer/pgbouncer/issues/976)). | ✗ | ✗ | ✓ |
 
 ## Run
 

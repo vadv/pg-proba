@@ -6,7 +6,7 @@ Feature: failed Parse must not kill the session
   valid query (schema_a.t), Bind, Execute. Direct PG: statement
   re-registered, DataRow 1. Pooler must keep the client connection
   open across a failed Parse. Profile cache100-size1: pool_size=1.
-  Upstream: pgbouncer issue #1630 (fix PR #1665 not merged).
+  Upstream: pgbouncer/pgbouncer#1630 (fix PR #1665 not merged).
 
   Background:
     Given PostgreSQL started with pg_hba.conf:

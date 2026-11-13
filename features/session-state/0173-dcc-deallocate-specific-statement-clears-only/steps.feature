@@ -6,7 +6,7 @@ Feature: DEALLOCATE one statement must not kill session
   remove_stmt re-Parse as select $1::int * 10 must yield 50.
   Direct PG: DEALLOCATE silently drops one statement, session
   stays usable. Pooler must keep client connection open.
-  Upstream: not reported; pgbouncer cleans PS maps only for
+  Upstream: pgbouncer/pgbouncer#1705 — pgbouncer cleans PS maps only for
   DEALLOCATE ALL / DISCARD ALL CommandComplete tags (src/server.c).
   2026-11-12: added "no ErrorResponse" assertion. CI on odyssey
   1.7.0-rc1 (master 190db18, image bump 4855bd8): PASS — named

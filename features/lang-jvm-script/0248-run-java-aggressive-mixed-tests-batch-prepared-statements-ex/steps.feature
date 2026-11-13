@@ -6,6 +6,9 @@ Feature: Java pgjdbc: aggressive mix
   must roll the insert back: next round reinserts val=1 into a fresh
   table without a duplicate key on test_batch_errors_val_key.
   Profile lang40: pool_size=40.
+  Upstream: yandex/odyssey#1840 (after 23505 in an explicit transaction,
+  Odyssey drops the statement from its server map and emits virtual
+  ParseComplete on retry, so Bind fails with 26000 instead of 25P02).
 
   Background:
     Given PostgreSQL started with pg_hba.conf:

@@ -12,7 +12,8 @@ Feature: Python psycopg2: server-side cursors
   session state"). Statement text is delivered verbatim by both; the earlier
   "mangled text" reading of the CI log was an artifact (BEGIN logged as a
   separate packet). Cross-client cursor leak confirmed on both poolers.
-  Neither doc warns that the object becomes VISIBLE to the next client.
+  Neither doc warns that the object becomes VISIBLE to the next client
+  (upstream discussion: pgbouncer/pgbouncer#976).
 
   Background:
     Given PostgreSQL started with pg_hba.conf:

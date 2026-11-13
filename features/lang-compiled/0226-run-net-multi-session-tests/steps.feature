@@ -7,6 +7,9 @@ Feature: Npgsql multi-session: parallel prepared statements
   clash. Transaction pooler must map client statements to
   server sessions without cross-client loss.
   Profile lang40: pool_size=40, max_prepared_statements=10000.
+  Upstream: pgbouncer/pgbouncer#1706 (SimpleQuery DISCARD ALL pipelined
+  with extended-protocol Parse wipes the newly registered statement in
+  src/server.c:218 when DISCARD ALL completes).
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
