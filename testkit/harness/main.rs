@@ -67,8 +67,6 @@ fn main() {
             std::env::var("FEATURES").unwrap_or_else(|_| "features".to_string());
         let writer = DoormanWorld::cucumber()
             .max_concurrent_scenarios(1)
-            // fail_fast removed: with 102 per-test scenarios the first failure
-            // must not hide the rest (triage needs the full picture).
             .with_cli(cli)
             .before(|feature, _rule, scenario, world| {
                 Box::pin(async move {
