@@ -103,6 +103,8 @@
             psycopg2
             aiopg
             pytest
+            pytest-asyncio
+            pytest-timeout
             sqlalchemy
             sqlmodel
           ]);
