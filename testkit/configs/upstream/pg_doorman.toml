@@ -23,6 +23,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "transaction"
+prepared_statements = true
 
 [[pools.p0.users]]
 username = "bouncer"
@@ -54,6 +55,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "transaction"
+prepared_statements = true
 
 [[pools.p1.users]]
 username = "bouncer"
@@ -85,6 +87,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "transaction"
+prepared_statements = true
 max_db_connections = 4
 
 [[pools.p2.users]]
@@ -117,6 +120,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "session"
+prepared_statements = true
 
 [[pools.p3.users]]
 username = "bouncer"
@@ -148,6 +152,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "transaction"
+prepared_statements = true
 
 [[pools.p3x.users]]
 username = "bouncer"
@@ -179,6 +184,7 @@ server_host = "127.0.0.1"
 server_port = ${PG_PORT}
 server_tls_mode = "disable"
 pool_mode = "transaction"
+prepared_statements = true
 server_lifetime = 2000
 
 [[pools.p9.users]]

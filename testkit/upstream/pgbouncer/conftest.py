@@ -126,13 +126,13 @@ class HarnessBouncer(Bouncer):
         return super().run_with_config(config)
 
     def admin(self, query, **kwargs):
-        if os.environ.get("POOLER") == "odyssey":
-            _skip("bouncer.admin(): Odyssey has no SQL admin console")
+        if os.environ.get("POOLER") != "pgbouncer":
+            _skip("bouncer.admin(): runtime config via admin console is PgBouncer-only")
         return super().admin(query, **kwargs)
 
     def aadmin(self, query, **kwargs):
-        if os.environ.get("POOLER") == "odyssey":
-            _skip("bouncer.aadmin(): Odyssey has no SQL admin console")
+        if os.environ.get("POOLER") != "pgbouncer":
+            _skip("bouncer.aadmin(): runtime config via admin console is PgBouncer-only")
         return super().aadmin(query, **kwargs)
 
     @contextmanager

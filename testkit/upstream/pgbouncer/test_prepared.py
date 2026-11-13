@@ -1,3 +1,4 @@
+import os
 import random
 import time
 
@@ -8,9 +9,7 @@ from psycopg.rows import dict_row
 
 from .utils import LIBPQ_SUPPORTS_PIPELINING, LINUX, PKT_BUF_SIZE, USE_SUDO
 
-
 def test_prepared_statement(bouncer):
-    bouncer.admin(f"set pool_mode=transaction")
     prepared_query = "SELECT 1"
     with bouncer.cur() as cur1, bouncer.cur() as cur2:
         # prepare query on server 1 and client 1
@@ -28,9 +27,7 @@ def test_prepared_statement(bouncer):
             # prepared query for this different client.
             cur2.execute(prepared_query, prepare=True)
 
-
 def test_prepared_statement_params(bouncer):
-    bouncer.admin(f"set pool_mode=transaction")
     prepared_query = "SELECT %s"
     with bouncer.cur() as cur1, bouncer.cur() as cur2:
         # prepare query on server 1 and client 1
@@ -48,7 +45,6 @@ def test_prepared_statement_params(bouncer):
             # prepared query for this different client.
             cur2.execute(prepared_query, params=(1,), prepare=True)
 
-
 @pytest.mark.parametrize("command", ["DISCARD ALL", "DEALLOCATE ALL"])
 def test_discard_or_deallocate_all(bouncer, command):
     """
@@ -57,7 +53,6 @@ def test_discard_or_deallocate_all(bouncer, command):
     statement cache. This scenario is implemented with raw libpq calls to
     bypass psycopg's special DISCARD ALL handling.
     """
-    bouncer.admin(f"set pool_mode=transaction")
     with bouncer.conn() as conn1, bouncer.conn() as conn2:
         # prepare and execute query on client 1
         result = conn1.pgconn.prepare(b"mystmt", b"SELECT 1")
@@ -94,14 +89,12 @@ def test_discard_or_deallocate_all(bouncer, command):
             or b"server closed the connection unexpectedly" in result.error_message
         )
 
-
 def test_parse_larger_than_pkt_buf(bouncer):
     long_string = "1" * PKT_BUF_SIZE * 10
     prepared_query = "SELECT '" + long_string + "'"
     with bouncer.cur() as cur1:
         result = cur1.execute(prepared_query, prepare=True).fetchone()[0]
         assert result == long_string
-
 
 def test_bind_larger_than_pkt_buf(bouncer):
     long_string = "1" * PKT_BUF_SIZE * 10
@@ -111,7 +104,6 @@ def test_bind_larger_than_pkt_buf(bouncer):
             prepared_query, params=(long_string,), prepare=True
         ).fetchone()[0]
         assert result == long_string
-
 
 # The 4x larger than pkt_buf amount is special, because if the extra_packets
 # buffer becomes larger than that it will be freed.
@@ -123,7 +115,6 @@ def test_parse_larger_than_pkt_buf_but_smaller_than_4x(bouncer):
         result = cur1.execute(prepared_query, prepare=True).fetchone()[0]
         assert result == long_string
 
-
 def test_bind_larger_than_pkt_buf_but_smaller_than_4x(bouncer):
     long_string = "1" * PKT_BUF_SIZE * 2
     prepared_query = "SELECT %s::text"
@@ -132,7 +123,6 @@ def test_bind_larger_than_pkt_buf_but_smaller_than_4x(bouncer):
             prepared_query, params=(long_string,), prepare=True
         ).fetchone()[0]
         assert result == long_string
-
 
 # In one of the initial implementation of prepared statement support there was
 # a bug, that if a varcache change was needed, then the callback would not be
@@ -144,9 +134,10 @@ def test_parse_larger_than_pkt_buf_with_varcache_change(bouncer):
         result = cur1.execute(prepared_query, prepare=True).fetchone()[0]
         assert result == long_string
 
-
+@pytest.mark.skipif(os.environ.get("POOLER") != "pgbouncer", reason="dynamic max_prepared_statements is a PgBouncer admin-console knob")
 def test_evict_statement_cache(bouncer):
     bouncer.admin(f"set max_prepared_statements=1")
+
     with bouncer.cur() as cur:
         for i in range(5):
             prepared_query = f"SELECT '{i}'"
@@ -204,10 +195,8 @@ def test_evict_statement_cache(bouncer):
         ).fetchone()[0]
         assert n_statements == 2
 
-
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_evict_statement_cache_pipeline_failure(bouncer):
-    bouncer.admin(f"set max_prepared_statements=1")
 
     with bouncer.conn() as conn, conn.pipeline() as p:
         curs = [conn.cursor() for _ in range(4)]
@@ -219,7 +208,6 @@ def test_evict_statement_cache_pipeline_failure(bouncer):
         curs[0].execute("SELECT 1", prepare=True)
         p.sync()
         assert curs[0].fetchall() == [(1,)]
-
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_statement_pipeline(bouncer):
@@ -253,7 +241,6 @@ def test_prepared_statement_pipeline(bouncer):
         assert curs[2].fetchall() == [(3,)]
         assert curs[3].fetchall() == [(1,)]
 
-
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 @pytest.mark.timeout(300)
 def test_prepared_statement_pipeline_stress(bouncer):
@@ -262,7 +249,6 @@ def test_prepared_statement_pipeline_stress(bouncer):
     n_iterations = 100
     max_prepared_statements = max_prepared_stmt * 2 // 3
     size_of_param = 512
-    bouncer.admin(f"set max_prepared_statements={max_prepared_statements}")
 
     for pipeline_length in range(max_pipeline_length):
         # Try with a prepared query first and a unprepared query second
@@ -281,15 +267,12 @@ def test_prepared_statement_pipeline_stress(bouncer):
                 for i in range(pipeline_length):
                     assert curs[i].fetchall() == [(i, str(i).zfill(size_of_param))]
 
-
 def test_describe_non_existent_prepared_statement(bouncer):
-    bouncer.admin(f"set max_prepared_statements=100")
 
     with bouncer.conn() as conn:
         result = conn.pgconn.describe_prepared(b"doesnotexist")
         assert result.status == pq.ExecStatus.FATAL_ERROR
         assert b"server closed the connection unexpectedly" in result.error_message
-
 
 # libpq before PG17 does not support sending Close messages
 @pytest.mark.skipif("psycopg.pq.version() < 170000")
@@ -311,7 +294,6 @@ def test_close_prepared_statement(bouncer):
         result = conn.pgconn.describe_prepared(b"test")
         assert result.status == pq.ExecStatus.FATAL_ERROR
 
-
 def collect_pipeline_results(pgconn, max_results=20):
     """Collect the pipeline result statuses, up to and including the sync.
 
@@ -328,7 +310,6 @@ def collect_pipeline_results(pgconn, max_results=20):
             return statuses
     raise AssertionError(f"no pipeline sync after {max_results} results: {statuses}")
 
-
 # libpq before PG17 does not support sending Close messages
 @pytest.mark.skipif("psycopg.pq.version() < 170000")
 @pytest.mark.skipif(
@@ -344,7 +325,6 @@ def test_close_batched_with_reused_parse(bouncer):
     query that is already prepared. It makes both replies itself. The client
     must get them in the order that it asked for.
     """
-    bouncer.admin("set max_prepared_statements=100")
 
     with bouncer.conn() as conn:
         pgconn = conn.pgconn
@@ -371,7 +351,6 @@ def test_close_batched_with_reused_parse(bouncer):
         assert result.status == pq.ExecStatus.TUPLES_OK
         assert result.get_value(0, 0) == b"2"
 
-
 # libpq before PG17 does not support sending Close messages
 @pytest.mark.skipif("psycopg.pq.version() < 170000")
 @pytest.mark.skipif(
@@ -387,7 +366,6 @@ def test_close_batched_with_evicting_parse(bouncer):
     and discard the CloseComplete. The discard must not delay the CloseComplete
     that the client waits for.
     """
-    bouncer.admin("set max_prepared_statements=1")
 
     with bouncer.conn() as conn:
         pgconn = conn.pgconn
@@ -413,7 +391,6 @@ def test_close_batched_with_evicting_parse(bouncer):
         assert result.status == pq.ExecStatus.TUPLES_OK
         assert result.get_value(0, 0) == b"3"
 
-
 def test_statement_name_longer_than_pkt_buf(bouncer):
     name = b"a" * PKT_BUF_SIZE * 4
 
@@ -435,7 +412,6 @@ def test_statement_name_longer_than_pkt_buf(bouncer):
             result = conn.pgconn.describe_prepared(name)
             assert result.status == pq.ExecStatus.FATAL_ERROR
 
-
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_statement_pipeline_error(bouncer):
     # Prepare query on the server connection and then disconnect again
@@ -453,7 +429,6 @@ def test_prepared_statement_pipeline_error(bouncer):
             p.sync()
         cur.execute(prepared_query, prepare=True)
         assert cur.fetchall() == [(1,)]
-
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_statement_pipeline_error_delayed_sync(bouncer):
@@ -483,7 +458,6 @@ def test_prepared_statement_pipeline_error_delayed_sync(bouncer):
         cur.execute(prepared_query, prepare=True)
         assert cur.fetchall() == [(1,)]
 
-
 def test_prepared_failed_prepare(bouncer):
     with bouncer.cur() as cur:
         with pytest.raises(psycopg.errors.UndefinedTable):
@@ -491,7 +465,6 @@ def test_prepared_failed_prepare(bouncer):
         cur.execute("CREATE TABLE doesnotexistyet (a int)")
         cur.execute("SELECT * FROM doesnotexistyet", prepare=True)
         cur.execute("DROP TABLE doesnotexistyet")
-
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_failed_prepare_pipeline(bouncer):
@@ -515,7 +488,6 @@ def test_prepared_failed_prepare_pipeline(bouncer):
         p.sync()
         cur.execute("DROP TABLE doesnotexistyet")
 
-
 def test_prepared_disallow_name_reuse(bouncer):
     with bouncer.conn() as conn:
         result = conn.pgconn.prepare(b"test", b"SELECT 1")
@@ -523,7 +495,6 @@ def test_prepared_disallow_name_reuse(bouncer):
         with bouncer.log_contains("prepared statement 'test' was already prepared"):
             result = conn.pgconn.prepare(b"test", b"SELECT 1")
             assert result.status == pq.ExecStatus.FATAL_ERROR
-
 
 # This reproduces a bug that was found by running the JDBC test suite. We would
 # only remove old data from the packet buffer when the amount of unparsed data
@@ -548,7 +519,6 @@ def test_pipeline_with_half_pkt_buf_prepare(bouncer):
         assert conn.pgconn.get_result() is None
         assert conn.pgconn.get_result().status == pq.ExecStatus.PIPELINE_SYNC
         conn.pgconn.exit_pipeline_mode()
-
 
 # This reproduces a bug that was found by running the JDBC test suite. The
 # problem was that when we could not fit the entire prepare massage in pkt_buf
@@ -588,7 +558,6 @@ def test_pipeline_flushes_on_full_pkt_buf(bouncer):
         assert conn.pgconn.get_result().status == pq.ExecStatus.PIPELINE_SYNC
         conn.pgconn.exit_pipeline_mode()
 
-
 # This resolves a bug where we would incorrectly release a server connection
 # even though there were still requests in flight. This was causing a weird
 # errors in Npgsql, because halfway through the second transaction its
@@ -597,7 +566,6 @@ def test_pipeline_flushes_on_full_pkt_buf(bouncer):
 # See #714 for the initial report
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_pause_before_last_sync(bouncer):
-    bouncer.admin(f"set pool_mode=transaction")
     with bouncer.conn() as conn1, bouncer.cur() as cur2:
         conn1.pgconn.enter_pipeline_mode()
         conn1.pgconn.send_prepare(b"", b"SELECT $1::text")
@@ -635,7 +603,6 @@ def test_pause_before_last_sync(bouncer):
             assert conn1.pgconn.get_result() is None
             assert conn1.pgconn.get_result().status == pq.ExecStatus.PIPELINE_SYNC
 
-
 @pytest.mark.skipif("not LINUX", reason="add_latency only supports Linux")
 @pytest.mark.skipif("not USE_SUDO")
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
@@ -660,10 +627,9 @@ def test_prepared_statement_pipeline_latency(bouncer, pg):
         for i in range(num_queries):
             assert curs[i].fetchone()[0] == str(i)
 
-
+@pytest.mark.skipif(os.environ.get("POOLER") != "pgbouncer", reason="dynamic max_prepared_statements is a PgBouncer admin-console knob")
 def test_prepared_statement_counters(bouncer):
     bouncer.default_db = "p0"
-    bouncer.admin(f"set pool_mode=transaction")
 
     # Explicitly disable prepared statement support
     bouncer.admin(f"set max_prepared_statements=0")

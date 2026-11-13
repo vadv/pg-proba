@@ -220,7 +220,6 @@ def test_copy_stdin_error_before_copy_done_in_transaction(bouncer):
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_copy_stdin_success_prepared(bouncer):
-    bouncer.admin(f"set max_prepared_statements=100")
 
     with bouncer.conn() as conn:
         conn.pgconn.enter_pipeline_mode()
@@ -242,7 +241,6 @@ def test_copy_stdin_success_prepared(bouncer):
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_copy_stdin_error_before_copy_done_prepared(bouncer):
-    bouncer.admin(f"set max_prepared_statements=100")
 
     with bouncer.conn() as conn:
         conn.pgconn.enter_pipeline_mode()
@@ -269,7 +267,6 @@ def test_copy_stdin_error_before_copy_done_prepared(bouncer):
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_copy_stdin_error_after_copy_done_prepared(bouncer):
-    bouncer.admin(f"set max_prepared_statements=100")
 
     with bouncer.conn() as conn:
         conn.pgconn.enter_pipeline_mode()
@@ -292,7 +289,6 @@ def test_copy_stdin_error_after_copy_done_prepared(bouncer):
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_copy_stdout_prepared(bouncer):
-    bouncer.admin(f"set max_prepared_statements=100")
 
     bouncer.sql("TRUNCATE test_copy")
     bouncer.sql("INSERT INTO test_copy VALUES (1), (2)")

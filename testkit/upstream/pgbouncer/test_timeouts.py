@@ -294,7 +294,6 @@ def test_query_timeout(bouncer):
 
 def test_user_level_idle_client_timeout_negative(bouncer):
     """Test user level client_idle_timeout correctly closes connection."""
-    bouncer.admin("set pool_mode=transaction")
     config = f"""
         [databases]
         postgres = host={bouncer.pg.host} port={bouncer.pg.port}
@@ -328,7 +327,6 @@ def test_user_level_idle_client_timeout_negative(bouncer):
 
 def test_user_level_idle_client_timeout(bouncer):
     """Test that user level client_idle_timeout allows connection to stay open."""
-    bouncer.admin("set pool_mode=transaction")
     config = f"""
         [databases]
         postgres = host={bouncer.pg.host} port={bouncer.pg.port}
@@ -357,7 +355,6 @@ def test_user_level_idle_client_timeout(bouncer):
 
 def test_user_level_idle_client_timeout_override(bouncer):
     """Test that user level client_idle_timeout overrides global level setting."""
-    bouncer.admin("set pool_mode=transaction")
     config = f"""
         [databases]
         postgres = host={bouncer.pg.host} port={bouncer.pg.port}
@@ -515,7 +512,6 @@ def test_transaction_timeout(bouncer):
 
 
 def test_idle_transaction_timeout(bouncer):
-    bouncer.admin(f"set pool_mode=transaction")
     bouncer.admin(f"set idle_transaction_timeout=2")
 
     with (
@@ -716,7 +712,6 @@ def test_query_timeout_when_no_active_query(bouncer):
     causing idle connections to be disconnected.
     """
     bouncer.admin("set query_timeout=2")
-    bouncer.admin("set pool_mode=transaction")
     with bouncer.cur() as cur:
         cur.execute("BEGIN")
         cur.execute("SELECT 1")
