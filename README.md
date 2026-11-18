@@ -2,20 +2,26 @@
 
 Differential test suite for PostgreSQL connection poolers (PgBouncer, Odyssey, pg_doorman).
 
-246 protocol and driver scenarios plus 101 scenarios adapted from the upstream PgBouncer
-python suite (1.26.1) run against each pooler in transaction mode (with prepared statement
-caching enabled) and against direct PostgreSQL 16 as the reference.
+347 scenarios from two sources, run against each pooler in transaction mode (with
+prepared statement caching enabled) and against direct PostgreSQL 16 as the reference:
+
+- **246 tests written for this index** — derived from the pg_doorman BDD suite (MIT),
+  split into atomic one-behavior-per-test scenarios: wire-protocol assertions and
+  real client drivers.
+- **101 tests from the official PgBouncer python suite** (ISC, vendored at
+  `testkit/upstream/pgbouncer/`, tag 1.26.1) — adapted to run here as-is: one pytest
+  node per scenario.
 
 ## How it works
 
 - **Two test layers**: wire-level extended query protocol assertions (Parse/Bind/Execute/Flush/Sync parity with direct PG) and real client drivers (`libpq`, `psycopg2`/`psycopg3`, `pgjdbc`, `Npgsql`, `pgx`, `node-postgres`, `PDO`).
-- **A second corpus: the upstream PgBouncer suite** (ISC, vendored at `testkit/upstream/pgbouncer/`). Setup that upstream performs through the admin console is moved into static per-case config profiles (`testkit/upstream/cases.tsv` + `generate.py`); every case declares per-pooler capability — `unsupported` (by design) or `unadapted` (no workaround yet) with a reason — reported as N/A / UNADAPTED, never as PASS.
+- **A second corpus: the official PgBouncer python suite** (ISC, vendored at `testkit/upstream/pgbouncer/`). Setup that upstream performs through the admin console is moved into static per-case config profiles (`testkit/upstream/cases.tsv` + `generate.py`); every case declares per-pooler capability — `unsupported` (by design) or `unadapted` (no workaround yet) with a reason — reported as N/A / UNADAPTED, never as PASS.
 - **Self-contained scenarios**: each `features/<category>/NNNN-slug/steps.feature` defines the exact workload and pooler config profile.
 - **Reproducible environment**: PostgreSQL, all three poolers, and all language runtimes are pinned in a single Nix flake (`env/flake.lock`).
 
 ## Results
 
-347 tests × 3 poolers (246 original + 101 upstream-suite scenarios).
+347 tests × 3 poolers (246 pg_doorman-derived + 101 PgBouncer-suite scenarios).
 Linux, Docker environment (nix inside the image). The matrix runs on each push.
 Upstream-suite rows are measured by local matrix runs (2026-11-15..18) until
 the next CI run regenerates them.
