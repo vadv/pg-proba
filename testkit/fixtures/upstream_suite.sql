@@ -3,6 +3,7 @@
 -- conftest.py @ pgbouncer_1_26_1, trimmed to what the seven vendored
 -- test files actually use (no p2..p7, no longpass/LDAP users).
 CREATE ROLE bouncer LOGIN;
+SET password_encryption = 'scram-sha-256';
 CREATE ROLE pswcheck LOGIN SUPERUSER CREATEDB PASSWORD 'pgbouncer-check';
 CREATE ROLE someuser LOGIN PASSWORD 'anypasswd';
 CREATE ROLE test_error_message_user LOGIN;

@@ -1,9 +1,13 @@
 @upstream
+@supported-pgbouncer @unsupported-odyssey @unsupported-pg_doorman
 Feature: upstream test_timeouts.py::test_server_connect_timeout_establish
 
-  One pytest test from the official PgBouncer suite, vendored
-  verbatim into testkit/upstream/pgbouncer/. The harness starts
-  a fresh PostgreSQL and pooler (Background), then runs the test.
+  Adapted from PgBouncer 1.26.1. Native setup profile: default.
+  One pytest node, a fresh PostgreSQL and a fresh pooler per scenario.
+  Required extra resources: none.
+  pgbouncer: supported
+  odyssey: unsupported: pinned pooler has no query-execution timeout required by this assertion
+  pg_doorman: unsupported: pinned pooler has no query-execution timeout required by this assertion
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -18,6 +22,6 @@ Feature: upstream test_timeouts.py::test_server_connect_timeout_establish
   Scenario: test_server_connect_timeout_establish
     When I run shell command:
       """
-      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} python3 -m pytest -q "test_timeouts.py::test_server_connect_timeout_establish" -o asyncio_mode=auto --timeout=120 -p no:cacheprovider
+      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} timeout --kill-after=5s 70s python3 -m pytest -q "test_timeouts.py::test_server_connect_timeout_establish" -o asyncio_mode=auto --timeout=45 --timeout-method=thread -p no:cacheprovider
       """
     Then the command should succeed

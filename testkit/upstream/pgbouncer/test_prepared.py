@@ -9,6 +9,18 @@ from psycopg.rows import dict_row
 
 from .utils import LIBPQ_SUPPORTS_PIPELINING, LINUX, PKT_BUF_SIZE, USE_SUDO
 
+
+def assert_missing_statement(result):
+    assert result.status == pq.ExecStatus.FATAL_ERROR
+    assert (
+        result.error_field(pq.DiagnosticField.SQLSTATE) == b"26000"
+        or b"prepared statement did not exist" in result.error_message
+        or (
+            os.environ.get("POOLER") == "pgbouncer"
+            and b"server closed the connection unexpectedly" in result.error_message
+        )
+    ), result.error_message
+
 def test_prepared_statement(bouncer):
     prepared_query = "SELECT 1"
     with bouncer.cur() as cur1, bouncer.cur() as cur2:
@@ -81,13 +93,8 @@ def test_discard_or_deallocate_all(bouncer, command):
 
         # Confirm that the prepared query is not available anymore on
         # client 1
-        with bouncer.log_contains("prepared statement did not exist"):
-            result = conn1.pgconn.exec_prepared(b"mystmt", ())
-        assert result.status == pq.ExecStatus.FATAL_ERROR
-        assert (
-            b"prepared statement did not exist" in result.error_message
-            or b"server closed the connection unexpectedly" in result.error_message
-        )
+        result = conn1.pgconn.exec_prepared(b"mystmt", ())
+        assert_missing_statement(result)
 
 def test_parse_larger_than_pkt_buf(bouncer):
     long_string = "1" * PKT_BUF_SIZE * 10
@@ -130,9 +137,15 @@ def test_bind_larger_than_pkt_buf_but_smaller_than_4x(bouncer):
 def test_parse_larger_than_pkt_buf_with_varcache_change(bouncer):
     long_string = "1" * PKT_BUF_SIZE * 10
     prepared_query = "SELECT '" + long_string + "'"
+    # Seed the single backend with a different encoding without an admin API.
+    with bouncer.cur(dbname="varcache_change", client_encoding="SQL_ASCII") as cur:
+        backend = cur.execute("SELECT pg_backend_pid()").fetchone()[0]
+        assert cur.execute("SHOW client_encoding").fetchone()[0] == b"SQL_ASCII"
     with bouncer.cur(dbname="varcache_change") as cur1:
         result = cur1.execute(prepared_query, prepare=True).fetchone()[0]
         assert result == long_string
+        assert cur1.execute("SHOW client_encoding").fetchone()[0] == "UTF8"
+        assert cur1.execute("SELECT pg_backend_pid()").fetchone()[0] == backend
 
 @pytest.mark.skipif(os.environ.get("POOLER") != "pgbouncer", reason="dynamic max_prepared_statements is a PgBouncer admin-console knob")
 def test_evict_statement_cache(bouncer):
@@ -247,7 +260,7 @@ def test_prepared_statement_pipeline_stress(bouncer):
     max_pipeline_length = 10
     max_prepared_stmt = 100
     n_iterations = 100
-    max_prepared_statements = max_prepared_stmt * 2 // 3
+    # Profile server cache size: max_prepared_stmt * 2 // 3 == 66.
     size_of_param = 512
 
     for pipeline_length in range(max_pipeline_length):
@@ -271,8 +284,7 @@ def test_describe_non_existent_prepared_statement(bouncer):
 
     with bouncer.conn() as conn:
         result = conn.pgconn.describe_prepared(b"doesnotexist")
-        assert result.status == pq.ExecStatus.FATAL_ERROR
-        assert b"server closed the connection unexpectedly" in result.error_message
+        assert_missing_statement(result)
 
 # libpq before PG17 does not support sending Close messages
 @pytest.mark.skipif("psycopg.pq.version() < 170000")
@@ -449,6 +461,8 @@ def test_prepared_statement_pipeline_error_delayed_sync(bouncer):
             psycopg.errors.UndefinedColumn, match='column "aaaa" does not exist'
         ):
             cur.execute("SELECT 123")
+            # The prior error can be observed at send or fetch, depending on timing.
+            cur.fetchall()
 
         with pytest.raises(psycopg.errors.PipelineAborted):
             cur.fetchall()
@@ -492,9 +506,14 @@ def test_prepared_disallow_name_reuse(bouncer):
     with bouncer.conn() as conn:
         result = conn.pgconn.prepare(b"test", b"SELECT 1")
         assert result.status == pq.ExecStatus.COMMAND_OK
-        with bouncer.log_contains("prepared statement 'test' was already prepared"):
-            result = conn.pgconn.prepare(b"test", b"SELECT 1")
-            assert result.status == pq.ExecStatus.FATAL_ERROR
+        result = conn.pgconn.prepare(b"test", b"SELECT 1")
+        assert result.status == pq.ExecStatus.FATAL_ERROR
+        assert (
+            result.error_field(pq.DiagnosticField.SQLSTATE) == b"42P05"
+            or b"was already prepared" in result.error_message
+            or (os.environ.get("POOLER") == "pgbouncer"
+                and b"server closed the connection unexpectedly" in result.error_message)
+        ), result.error_message
 
 # This reproduces a bug that was found by running the JDBC test suite. We would
 # only remove old data from the packet buffer when the amount of unparsed data
