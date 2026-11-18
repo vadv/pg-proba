@@ -22,10 +22,22 @@ tell it is not talking to PostgreSQL.
 
 ## Corpus
 
-The corpus comes from the pg_doorman BDD suite (MIT). Upstream scenarios
-bundle many checks into one; here one test = one behavior, so the corpus is
-split into atomic tests. The 183 upstream scenarios are heritage, not the
-test count.
+Two sources:
+
+- The pg_doorman BDD suite (MIT). Upstream scenarios bundle many checks into
+  one; here one test = one behavior, so the corpus is split into atomic tests.
+  The 183 upstream scenarios are heritage, not the test count.
+- The upstream PgBouncer python suite (ISC, vendored at
+  `testkit/upstream/pgbouncer/`, tag `pgbouncer_1_26_1`), one pytest node per
+  feature. Runtime setup that upstream does via the admin console
+  (`SET`/`RELOAD`) is moved into static per-case config profiles rendered by
+  `testkit/upstream/generate.py` from the triage table `testkit/upstream/cases.tsv`.
+  Every node declares per-pooler capability — `supported`, `unsupported:` (by
+  design), `unadapted:` (no workaround yet) — with a mandatory reason; the
+  harness reports N/A / UNADAPTED before starting services and never as PASS.
+  Where a pooler legitimately differs by design (e.g. pg_doorman keeps serving
+  prepared statements across a client DISCARD ALL), the case is scored N/A for
+  that pooler — the expectation itself is never softened.
 
 ## Working rules
 
