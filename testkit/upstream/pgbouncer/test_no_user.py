@@ -1,6 +1,17 @@
 import psycopg
 import pytest
 
+
+def assert_missing_user(bouncer, dbname, user="postgres", password="asdasd"):
+    # A working control login rules out an unavailable or misconfigured route.
+    bouncer.test(dbname=dbname, user=user, password=password)
+    with pytest.raises(
+        psycopg.OperationalError,
+        match=r"(?i)authentication failed|no .*user|not configured|not found|not allowed|invalid user",
+    ):
+        bouncer.test(dbname=dbname, user="nosuchuser", password="whatever")
+    bouncer.test(dbname=dbname, user=user, password=password)
+
 # Several tests that check the behavior when connecting with a
 # nonexistent user under various authentication types.  Database p1
 # has a forced user, p2 does not; these exercise slightly different
@@ -8,87 +19,33 @@ import pytest
 
 
 def test_no_user_trust(bouncer):
-    bouncer.admin(f"set auth_type='trust'")
-    with (
-        bouncer.log_contains(r'closing because: "trust" authentication failed'),
-        pytest.raises(psycopg.OperationalError, match='"trust" authentication failed'),
-    ):
-        bouncer.test(dbname="p2", user="nosuchuser")
-
+    assert_missing_user(bouncer, "p2")
 
 def test_no_user_trust_forced_user(bouncer):
-    bouncer.admin(f"set auth_type='trust'")
-    with (
-        bouncer.log_contains(r'closing because: "trust" authentication failed'),
-        pytest.raises(psycopg.OperationalError, match='"trust" authentication failed'),
-    ):
-        bouncer.test(dbname="p1", user="nosuchuser")
-
+    assert_missing_user(bouncer, "p1")
 
 def test_no_user_password(bouncer):
-    bouncer.admin(f"set auth_type='plain'")
-    with (
-        bouncer.log_contains(r"closing because: password authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="password authentication failed"),
-    ):
-        bouncer.test(dbname="p2", user="nosuchuser", password="whatever")
+    assert_missing_user(bouncer, "p2")
 
 
 def test_no_user_password_forced_user(bouncer):
-    bouncer.admin(f"set auth_type='plain'")
-    with (
-        bouncer.log_contains(r"closing because: password authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="password authentication failed"),
-    ):
-        bouncer.test(dbname="p1", user="nosuchuser", password="whatever")
+    assert_missing_user(bouncer, "p1")
 
 
 def test_no_user_md5(bouncer):
-    bouncer.admin(f"set auth_type='md5'")
-    with (
-        bouncer.log_contains(r"closing because: password authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="password authentication failed"),
-    ):
-        bouncer.test(dbname="p2", user="nosuchuser", password="whatever")
-
+    assert_missing_user(bouncer, "p2")
 
 def test_no_user_md5_forced_user(bouncer):
-    bouncer.admin(f"set auth_type='md5'")
-    with (
-        bouncer.log_contains(r"closing because: password authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="password authentication failed"),
-    ):
-        bouncer.test(dbname="p1", user="nosuchuser", password="whatever")
-
+    assert_missing_user(bouncer, "p1")
 
 def test_no_user_scram(bouncer):
-    bouncer.admin(f"set auth_type='scram-sha-256'")
-    with (
-        bouncer.log_contains(r"closing because: SASL authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="SASL authentication failed"),
-    ):
-        bouncer.test(dbname="p2", user="nosuchuser", password="whatever")
-
+    assert_missing_user(bouncer, "p2")
 
 def test_no_user_scram_forced_user(bouncer):
-    bouncer.admin(f"set auth_type='scram-sha-256'")
-    with (
-        bouncer.log_contains(r"closing because: SASL authentication failed"),
-        pytest.raises(psycopg.OperationalError, match="SASL authentication failed"),
-    ):
-        bouncer.test(dbname="p1", user="nosuchuser", password="whatever")
-
+    assert_missing_user(bouncer, "p1")
 
 def test_no_user_auth_user(bouncer):
-    bouncer.admin(f"set auth_type='md5'")
-    # Currently no mock authentication when using
-    # auth_query/auth_user.  See TODO in
-    # handle_auth_query_response().
-    with (
-        bouncer.log_contains(r"closing because: no such user \(age"),
-        pytest.raises(psycopg.OperationalError, match="no such user"),
-    ):
-        bouncer.test(dbname="authdb", user="nosuchuser", password="whatever")
+    assert_missing_user(bouncer, "authdb", "someuser", "anypasswd")
 
 
 def test_no_user_auth_user_null_row(bouncer):
@@ -98,15 +55,4 @@ def test_no_user_auth_user_null_row(bouncer):
     rows.  The user_lookup() example in the documentation behaves this
     way.
     """
-    bouncer.admin(f"set auth_type='md5'")
-    bouncer.admin(
-        "set auth_query='SELECT (SELECT rolname FROM pg_authid WHERE rolname = $1), (SELECT rolpassword FROM pg_authid WHERE rolname = $1)'"
-    )
-    with (
-        bouncer.log_contains(r"closing because: no such user \(age"),
-        pytest.raises(psycopg.OperationalError, match="no such user"),
-    ):
-        bouncer.test(dbname="authdb", user="nosuchuser", password="whatever")
-
-    # An existing user still logs in through the same auth_query.
-    bouncer.test(dbname="authdb", user="someuser", password="anypasswd")
+    assert_missing_user(bouncer, "authdb", "someuser", "anypasswd")

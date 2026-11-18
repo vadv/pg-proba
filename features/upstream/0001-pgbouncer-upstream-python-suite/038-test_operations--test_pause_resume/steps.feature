@@ -1,9 +1,13 @@
 @upstream
+@supported-pgbouncer @unadapted-odyssey @unadapted-pg_doorman
 Feature: upstream test_operations.py::test_pause_resume
 
-  One pytest test from the official PgBouncer suite, vendored
-  verbatim into testkit/upstream/pgbouncer/. The harness starts
-  a fresh PostgreSQL and pooler (Background), then runs the test.
+  Adapted from PgBouncer 1.26.1. Native setup profile: wait-120.
+  One pytest node, a fresh PostgreSQL and a fresh pooler per scenario.
+  Required extra resources: none.
+  pgbouncer: supported
+  odyssey: unadapted: Live PgBouncer console assertions retained unchanged; other console adapters are not implemented
+  pg_doorman: unadapted: Live PgBouncer console assertions retained unchanged; other console adapters are not implemented
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -13,11 +17,11 @@ Feature: upstream test_operations.py::test_pause_resume
       host all all ::1/128 trust
       """
     And fixtures from "testkit/fixtures/upstream_suite.sql" applied
-    And pooler started with config from "testkit/configs/upstream"
+    And pooler started with config from "testkit/configs/upstream/wait-120"
 
   Scenario: test_pause_resume
     When I run shell command:
       """
-      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} python3 -m pytest -q "test_operations.py::test_pause_resume" -o asyncio_mode=auto --timeout=120 -p no:cacheprovider
+      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} timeout --kill-after=5s 70s python3 -m pytest -q "test_operations.py::test_pause_resume" -o asyncio_mode=auto --timeout=45 --timeout-method=thread -p no:cacheprovider
       """
     Then the command should succeed

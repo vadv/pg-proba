@@ -9,6 +9,32 @@
 - Степ-реализации протокольных шагов, wire-клиент и хелперы запуска пулеров
   (odyssey/pgbouncer/doorman) — производные от `tests/bdd/*.rs` того же репо.
 
-## yandex/odyssey, pgbouncer/pgbouncer
+## pgbouncer/pgbouncer (ISC)
 
-Используются как тестируемые приложения; их код не включён.
+- `testkit/upstream/pgbouncer/` — python-сьют (test_*.py, utils.py): производные
+  от `test/` репозитория `https://github.com/pgbouncer/pgbouncer`, тег
+  `pgbouncer_1_26_1`, адаптированные под харнесс этого проекта
+  (адаптер — conftest.py/results.py).
+- Лицензия ISC:
+
+      PgBouncer - Lightweight connection pooler for PostgreSQL.
+
+      ISC License
+
+      Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
+
+      Permission to use, copy, modify, and/or distribute this software for any
+      purpose with or without fee is hereby granted, provided that the above
+      copyright notice and this permission notice appear in all copies.
+
+      THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+      WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+      MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+      ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+      WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+      ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+      OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+## yandex/odyssey
+
+Используется как тестируемое приложение; его код не включён.

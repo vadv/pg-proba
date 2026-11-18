@@ -24,8 +24,7 @@ def test_cancel(bouncer):
 # unused connections close and pool slots are available, those are not
 # used for waiting cancel requests.
 def test_cancel_wait(bouncer):
-    # default_pool_size=5
-    bouncer.admin(f"set server_idle_timeout=2")
+    # Profile: pool_size=5, server_idle_timeout=2.
 
     with bouncer.cur(dbname="p3") as cur, ThreadPoolExecutor(max_workers=6) as pool:
         q1 = pool.submit(cur.execute, "select pg_sleep(5)")
@@ -45,8 +44,7 @@ def test_cancel_wait(bouncer):
 # Cancel request connections can use twice the pool size.  See also GH
 # PR #543.
 def test_cancel_pool_size(bouncer):
-    # default_pool_size=5
-    bouncer.admin(f"set server_idle_timeout=2")
+    # Profile: pool_size=5, server_idle_timeout=2.
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         conns = [bouncer.conn(dbname="p3") for _ in range(5)]
@@ -80,9 +78,7 @@ def test_cancel_pool_size(bouncer):
 def test_cancel_race(bouncer):
     # Make sure only one query can run at the same time so that its ensured
     # that both clients will use the same server connection.
-    bouncer.admin("set default_pool_size=1")
-    bouncer.admin("set server_idle_timeout=2")
-    bouncer.admin("set verbose=1")
+    # Profile: pool_size=1, server_idle_timeout=2.
     conn1 = bouncer.conn(dbname="p1")
     cur1 = conn1.cursor()
     conn2 = bouncer.conn(dbname="p1")
@@ -106,7 +102,6 @@ def test_cancel_race(bouncer):
             ):
                 q1.result()
             q2.result()
-            bouncer.print_logs()
     finally:
         conn1.close()
         conn2.close()

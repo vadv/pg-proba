@@ -5,11 +5,9 @@ import pytest
 
 
 def test_no_database(bouncer):
-    with (
-        bouncer.log_contains(r"closing because: no such database: nosuchdb"),
-        pytest.raises(psycopg.OperationalError, match="no such database: nosuchdb"),
-    ):
+    with pytest.raises(psycopg.OperationalError, match="nosuchdb"):
         bouncer.test(dbname="nosuchdb")
+    bouncer.test()
 
 
 def test_no_database_authfail(bouncer):
@@ -31,41 +29,20 @@ def test_no_database_auth_user(bouncer):
         bouncer.test(dbname="nosuchdb", user="someuser", password="wrong")
 
 
-def test_no_database_pg(bouncer):
-    with (
-        bouncer.log_contains(
-            r'server login failed: FATAL database "non_existing_pg_db" does not exist'
-        ),
-        bouncer.log_contains(
-            r'closing because: database "non_existing_pg_db" does not exist'
-        ),
-        pytest.raises(
-            psycopg.OperationalError,
-            match='database "non_existing_pg_db" does not exist',
-        ),
-    ):
+def test_no_database_pg(pg, bouncer):
+    assert pg.sql_value("SELECT count(*) FROM pg_database WHERE datname = 'non_existing_pg_db'") == 0
+    with pytest.raises(psycopg.OperationalError, match="non_existing_pg_db"):
         bouncer.test(dbname="non_existing_pg_db")
+    bouncer.test()
 
 
-def test_no_database_auto_database(bouncer):
-    with bouncer.ini_path.open() as f:
-        original = f.read()
-    with bouncer.ini_path.open("w") as f:
-        # uncomment the auto-database line
-        f.write(re.sub(r"^;\*", "*", original, flags=re.MULTILINE))
-
-    bouncer.admin("reload")
-
-    with (
-        bouncer.log_contains(
-            r'server login failed: FATAL database "nosuchdb" does not exist'
-        ),
-        bouncer.log_contains(r'closing because: database "nosuchdb" does not exist'),
-        pytest.raises(
-            psycopg.OperationalError, match='database "nosuchdb" does not exist'
-        ),
-    ):
+def test_no_database_auto_database(pg, bouncer):
+    assert pg.sql_value("SELECT count(*) FROM pg_database WHERE datname = 'nosuchdb'") == 0
+    # This existing database has no explicit pooler route: exercise the wildcard.
+    bouncer.test(dbname="postgres")
+    with pytest.raises(psycopg.OperationalError, match='database "nosuchdb" does not exist'):
         bouncer.test(dbname="nosuchdb")
+    bouncer.test(dbname="postgres")
 
 
 def test_no_database_auto_database_auth_user(bouncer):

@@ -1,9 +1,13 @@
 @upstream
+@supported-pgbouncer @unsupported-odyssey @unsupported-pg_doorman
 Feature: upstream test_timeouts.py::test_user_level_idle_client_timeout_override
 
-  One pytest test from the official PgBouncer suite, vendored
-  verbatim into testkit/upstream/pgbouncer/. The harness starts
-  a fresh PostgreSQL and pooler (Background), then runs the test.
+  Adapted from PgBouncer 1.26.1. Native setup profile: default.
+  One pytest node, a fresh PostgreSQL and a fresh pooler per scenario.
+  Required extra resources: none.
+  pgbouncer: supported
+  odyssey: unsupported: pinned Odyssey checks client idle timeout only in session mode; this user explicitly uses transaction mode
+  pg_doorman: unsupported: pinned Doorman has no frontend client-idle timeout; idle_timeout applies to backend connections
 
   Background:
     Given PostgreSQL started with pg_hba.conf:
@@ -18,6 +22,6 @@ Feature: upstream test_timeouts.py::test_user_level_idle_client_timeout_override
   Scenario: test_user_level_idle_client_timeout_override
     When I run shell command:
       """
-      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} python3 -m pytest -q "test_timeouts.py::test_user_level_idle_client_timeout_override" -o asyncio_mode=auto --timeout=120 -p no:cacheprovider
+      cd testkit/upstream/pgbouncer && POOLER_PORT=${DOORMAN_PORT} PG_PORT=${PG_PORT} PGBOUNCER_INI=${PGBOUNCER_CONFIG} PGBOUNCER_LOG=${PGBOUNCER_LOG} PGBOUNCER_USERLIST=${PGBOUNCER_USERLIST} timeout --kill-after=5s 70s python3 -m pytest -q "test_timeouts.py::test_user_level_idle_client_timeout_override" -o asyncio_mode=auto --timeout=45 --timeout-method=thread -p no:cacheprovider
       """
     Then the command should succeed

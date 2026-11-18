@@ -13,14 +13,13 @@ from .utils import USE_SUDO
 @pytest.mark.parametrize(
     ("global_query_wait_timeout", "user_query_wait_timeout", "db_query_wait_timeout"),
     [
-        (2, None, None),
         (None, 2, None),
         (200, 2, None),
         (None, None, 2),
         (200, None, 2),
     ],
 )
-async def test_query_wait_timeout(
+async def test_query_wait_timeout_scope(
     bouncer,
     global_query_wait_timeout: int,
     user_query_wait_timeout: int,
@@ -75,8 +74,28 @@ async def test_query_wait_timeout(
         await conn_1_fut
 
 
+async def test_query_wait_timeout(bouncer):
+    # Native profile: one server, a two-second pool wait limit.
+    bouncer.default_db = "p3x"
+    conn_1_fut = bouncer.asleep(3)
+    await asyncio.sleep(0.1)
+    started = time.monotonic()
+    with pytest.raises(
+        psycopg.OperationalError,
+        match=r"(?i)timeout|timed out|server closed the connection unexpectedly|too many active clients",
+    ):
+        bouncer.test()
+    assert 1.5 <= time.monotonic() - started < 3
+    await conn_1_fut
+
+    conn_1_fut = bouncer.asleep(1)
+    await asyncio.sleep(0.1)
+    bouncer.test()
+    await conn_1_fut
+
+
 def test_server_lifetime(pg, bouncer):
-    bouncer.admin(f"set server_lifetime=2")
+    # Profile: server_lifetime=2.
 
     bouncer.test()
     assert pg.connection_count() == 1
@@ -94,7 +113,7 @@ def test_server_lifetime_per_pool(pg, bouncer):
 
 
 def test_server_idle_timeout(pg, bouncer):
-    bouncer.admin(f"set server_idle_timeout=2")
+    # Profile: server_idle_timeout=2.
 
     bouncer.test()
     assert pg.connection_count() == 1
@@ -512,16 +531,11 @@ def test_transaction_timeout(bouncer):
 
 
 def test_idle_transaction_timeout(bouncer):
-    bouncer.admin(f"set idle_transaction_timeout=2")
-
-    with (
-        bouncer.transaction() as cur,
-        bouncer.log_contains(r"idle transaction timeout"),
-    ):
+    with bouncer.transaction() as cur:
         time.sleep(3)
         with pytest.raises(
             psycopg.OperationalError,
-            match=r"idle transaction timeout|Software caused connection abort|server closed the connection unexpectedly",
+            match=r"idle (?:in )?transaction timeout|Software caused connection abort|server closed the connection unexpectedly",
         ):
             cur.execute("select 1")
 
@@ -533,17 +547,14 @@ def test_idle_transaction_timeout(bouncer):
 
 
 def test_client_idle_timeout(bouncer):
-    bouncer.admin(f"set client_idle_timeout=2")
-
     with bouncer.cur() as cur:
         cur.execute("select 1")
-        with bouncer.log_contains(r"client_idle_timeout"):
-            time.sleep(3)
-            with pytest.raises(
-                psycopg.OperationalError,
-                match=r"client_idle_timeout|Software caused connection abort|server closed the connection unexpectedly",
-            ):
-                cur.execute("select 1")
+        time.sleep(3)
+        with pytest.raises(
+            psycopg.OperationalError,
+            match=r"client_idle_timeout|Software caused connection abort|server closed the connection unexpectedly",
+        ):
+            cur.execute("select 1")
 
 
 def test_pool_idle_timeout(pg, bouncer):

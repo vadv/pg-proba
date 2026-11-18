@@ -150,8 +150,7 @@ def test_copy_stdin_error_before_copy_done_transaction_pool(bouncer):
     ReadyForQuery handler fails to match it (not Query/Sync/FunctionCall),
     so outstanding_requests never empties and the server stays linked.
     """
-    bouncer.admin("set default_pool_size=1")
-    bouncer.admin("set query_wait_timeout=5")
+    # Profile: pool_size=1, query_wait_timeout=5.
 
     with bouncer.conn(dbname="p3x") as conn:
         conn.pgconn.send_query(b"COPY test_copy(i) FROM STDIN")
@@ -186,8 +185,7 @@ def test_copy_stdin_error_before_copy_done_in_transaction(bouncer):
     follow-up query, the server should be released.  Without the fix,
     the phantom CopyDone outstanding request prevents release.
     """
-    bouncer.admin("set default_pool_size=1")
-    bouncer.admin("set query_wait_timeout=5")
+    # Profile: pool_size=1, query_wait_timeout=5.
 
     with bouncer.conn(dbname="p3x") as conn:
         conn.pgconn.send_query(b"BEGIN")

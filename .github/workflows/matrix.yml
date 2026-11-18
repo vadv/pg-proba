@@ -121,7 +121,11 @@ jobs:
           echo "shard ${{ matrix.shard.name }}: $(echo $FEATURES_FILES | wc -w | tr -d ' ') tests"
           C="${{ runner.temp }}/caches"
           mkdir -p "$C"/{cargo-registry,cargo-git,target,gomod,m2,nuget,npm-cache,npm-global} .artifacts/logs
-          docker run --rm --init \
+          network_args=()
+          if [ -n "$FEATURES_FILES" ] && grep -q '^@network$' $FEATURES_FILES; then
+            network_args+=(--cap-add=NET_ADMIN)
+          fi
+          docker run --rm --init "${network_args[@]}" \
             -v "$PWD:/workspace" -w /workspace \
             --tmpfs /tmp:exec,mode=1777 \
             -v "$C/cargo-registry:/root/.cargo/registry" \
@@ -140,12 +144,12 @@ jobs:
               fails=0
               for f in $FEATURES_FILES; do
                 log=".artifacts/logs/$(basename "$(dirname "$f")").log"
-                if FEATURES="$f" cargo test --test bdd >"$log" 2>&1; then
-                  echo "PASS|$POOLER|$f" >> .artifacts/results.txt
-                  echo "PASS $POOLER $f"
-                else
-                  echo "FAIL|$POOLER|$f" >> .artifacts/results.txt
-                  echo "FAIL $POOLER $f"
+                code=0
+                FEATURES="$f" cargo test --test bdd >"$log" 2>&1 || code=$?
+                result=$(bash env/test-result.sh "$code" <"$log")
+                echo "$result|$POOLER|$f" >> .artifacts/results.txt
+                echo "$result $POOLER $f"
+                if [ "$result" = FAIL ] || [ "$result" = UNADAPTED ]; then
                   tail -40 "$log"
                   cp /tmp/*.log .artifacts/ 2>/dev/null || true
                   fails=1
@@ -176,9 +180,9 @@ jobs:
           {
             echo "# Matrix summary"
             echo
-            echo "| pooler | pass | fail |"
-            echo "|---|---|---|"
-            awk -F'|' '{p[$2]+=($1=="PASS"); f[$2]+=($1=="FAIL")} END {for (k in p) printf "| %s | %d | %d |\n", k, p[k], f[k]}' all-logs/results.txt 2>/dev/null || true
+            echo "| pooler | pass | fail | N/A | unadapted |"
+            echo "|---|---|---|---|---|"
+            awk -F'|' '{p[$2]+=($1=="PASS"); f[$2]+=($1=="FAIL"); n[$2]+=($1=="N/A"); u[$2]+=($1=="UNADAPTED")} END {for (k in p) printf "| %s | %d | %d | %d | %d |\n", k, p[k], f[k], n[k], u[k]}' all-logs/results.txt 2>/dev/null || true
             echo
             echo "## Failed tests"
             echo
