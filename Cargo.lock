@@ -1252,6 +1252,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pg-proba"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "cucumber",
+ "futures",
+ "hmac 0.12.1",
+ "jwt",
+ "libc",
+ "log",
+ "md-5 0.10.6",
+ "native-tls",
+ "openssl",
+ "portpicker",
+ "rand 0.9.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "socket2",
+ "stringprep",
+ "tempfile",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,37 +1332,6 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
-
-[[package]]
-name = "pg-proba"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "cucumber",
- "futures",
- "hmac 0.12.1",
- "jwt",
- "libc",
- "log",
- "md-5 0.10.6",
- "native-tls",
- "openssl",
- "portpicker",
- "rand 0.9.5",
- "regex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "socket2",
- "stringprep",
- "tempfile",
- "tokio",
- "tokio-native-tls",
- "tokio-postgres",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "portpicker"

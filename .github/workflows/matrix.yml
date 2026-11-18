@@ -2,6 +2,9 @@ name: matrix
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths: ['env/**', 'features/**', 'testkit/**', '.github/workflows/matrix.yml']
   push:
     branches: [main]
     paths: ['env/**', 'features/**', 'testkit/**', '.github/workflows/matrix.yml']
@@ -63,6 +66,7 @@ jobs:
           - {name: crash,           tags: 'stale fuzz rpipe pipe-disc'}
           - {name: lang-compiled,   tags: 'lang-go lang-dotnet'}
           - {name: lang-jvm-script, tags: 'lang-java lang-python lang-nodejs lang-php'}
+          - {name: upstream, tags: 'upstream'}
     steps:
       - uses: actions/checkout@v4
       - name: compute image tag

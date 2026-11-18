@@ -99,10 +99,13 @@
 
           pythonEnv = pkgs.python3.withPackages (ps: with ps; [
             asyncpg
+            filelock
             psycopg
             psycopg2
             aiopg
             pytest
+            pytest-asyncio
+            pytest-timeout
             sqlalchemy
             sqlmodel
           ]);
