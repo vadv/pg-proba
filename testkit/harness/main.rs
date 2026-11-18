@@ -7,15 +7,15 @@ mod fuzz_helper;
 mod mock_patroni_helper;
 mod odyssey_helper;
 mod pg_connection;
-mod pooler_helper;
 mod pgbouncer_helper;
+mod pooler_helper;
 mod postgres_helper;
 mod service_helper;
 mod shell_helper;
 mod utils;
 mod world;
 
-use cucumber::World;
+use cucumber::{tag::Ext as _, World};
 use world::DoormanWorld;
 
 fn main() {
@@ -63,8 +63,11 @@ fn main() {
         };
 
         // Корпус: папка с .feature или конкретный файл; по умолчанию — все атомарные тесты.
-        let features_path =
-            std::env::var("FEATURES").unwrap_or_else(|_| "features".to_string());
+        let features_path = std::env::var("FEATURES").unwrap_or_else(|_| "features".to_string());
+        let active_pooler = std::env::var("POOLER").unwrap_or_default();
+        // Cucumber's CLI filters replace filter_run; compose them ourselves.
+        let tags_filter = cli.tags_filter.take();
+        let name_filter = cli.re_filter.take();
         let writer = DoormanWorld::cucumber()
             .max_concurrent_scenarios(1)
             .with_cli(cli)
@@ -123,7 +126,56 @@ fn main() {
                 }
                 Box::pin(async {})
             })
-            .run(&features_path)
+            .filter_run(&features_path, move |feature, rule, scenario| {
+                if name_filter
+                    .as_ref()
+                    .is_some_and(|re| !re.is_match(&scenario.name))
+                    || tags_filter.as_ref().is_some_and(|tags| {
+                        !tags.eval(
+                            feature
+                                .tags
+                                .iter()
+                                .chain(rule.iter().flat_map(|r| &r.tags))
+                                .chain(scenario.tags.iter()),
+                        )
+                    })
+                {
+                    return false;
+                }
+                if !feature.tags.iter().any(|tag| tag == "upstream") {
+                    return true;
+                }
+                let pooler = active_pooler.as_str();
+                assert!(
+                    matches!(pooler, "pgbouncer" | "odyssey" | "pg_doorman"),
+                    "invalid POOLER={pooler}"
+                );
+                let capability = ["supported", "unsupported", "unadapted"]
+                    .into_iter()
+                    .find(|kind| feature.tags.contains(&format!("{kind}-{pooler}")))
+                    .expect("upstream feature must declare each pooler's capability");
+                if capability == "supported" {
+                    return true;
+                }
+                let label = if capability == "unsupported" {
+                    "UPSTREAM_NA"
+                } else {
+                    "UPSTREAM_UNADAPTED"
+                };
+                let reason = feature
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|line| line.trim_start().starts_with(&format!("{pooler}: ")))
+                    .unwrap_or("missing capability reason")
+                    .trim();
+                // One formatted string = one write(2): a concurrent summary
+                // line on stdout cannot split the label mid-line (PIPE_BUF).
+                let line = format!("{label} {pooler}: {} — {reason}", feature.name);
+                eprintln!("{line}");
+                false
+            })
             .await;
 
         use cucumber::writer::Stats;
