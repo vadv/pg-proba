@@ -157,6 +157,7 @@
             procps
             util-linux
             iproute2
+            iptables
             nettools
             curl
             wget

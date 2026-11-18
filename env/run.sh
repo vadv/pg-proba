@@ -18,6 +18,7 @@ fi
 run_in_container() {
   local cmd="$1"
   local interactive="${2:-false}"
+  local features="${3:-}"
   local args=(
     --rm --init
     -v "${ROOT}:/workspace"
@@ -30,6 +31,9 @@ run_in_container() {
     -v pg_proba_m2:/root/.m2/repository
     -v pg_proba_npm:/root/.npm-global
   )
+  if [ -n "$features" ] && grep -Rq '^@network$' "${ROOT}/${features}"; then
+    args+=(--cap-add=NET_ADMIN)
+  fi
   [ -t 1 ] && args+=(-t)
   [ "$interactive" = "true" ] && args+=(-i -t)
   docker run "${args[@]}" "${IMAGE}" bash -c "${cmd}"
@@ -51,22 +55,20 @@ case "${1:-matrix}" in
   test)
     pooler="${2:?pooler: odyssey|pgbouncer|pg_doorman}"
     features="${3:?путь до .feature}"
-    run_in_container "POOLER=${pooler} FEATURES=${features} cargo test --test bdd"
+    run_in_container "POOLER=${pooler} FEATURES=${features} cargo test --test bdd" false "$features"
     ;;
   matrix)
     echo "pooler      test                                            результат"
-    for f in "${ROOT}"/features/*/*/steps.feature; do
+    while IFS= read -r f; do
       rel="${f#"${ROOT}"/}"
       for p in odyssey pgbouncer pg_doorman; do
-        if res=$(run_in_container "POOLER=${p} FEATURES=${rel} cargo test --test bdd" 2>&1); then
-          status="PASS"
-        else
-          status="FAIL"
-        fi
-        summary=$(echo "$res" | grep -E "scenario \(" | tail -1)
+        code=0
+        res=$(run_in_container "POOLER=${p} FEATURES=${rel} cargo test --test bdd" false "$rel" 2>&1) || code=$?
+        status=$(printf '%s\n' "$res" | bash "${SCRIPT_DIR}/test-result.sh" "$code")
+        summary=$(printf '%s\n' "$res" | grep -E 'scenario(s)? \(|^UPSTREAM_(NA|UNADAPTED) ' | tail -1 || true)
         printf '%-11s %-47s %s %s\n' "$p" "$rel" "$status" "${summary:+($summary)}"
       done
-    done
+    done < <(find "${ROOT}/features" -name steps.feature -type f | sort)
     ;;
   *)
     echo "использование: $0 shell | test <pooler> <feature> | matrix" >&2
